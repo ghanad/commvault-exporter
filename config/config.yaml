@@ -1,0 +1,9 @@
+commvault:
+  api_url: ""
+  username: ""
+  password: ""
+  auth_token: ""
+exporter:
+  port: 9657
+  log_level: "INFO"
+  timeout: 30
