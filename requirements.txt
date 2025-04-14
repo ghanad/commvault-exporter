@@ -2,3 +2,4 @@ prometheus-client
 requests
 PyYAML
 Flask
+python-json-logger
