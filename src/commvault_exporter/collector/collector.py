@@ -1,6 +1,6 @@
 from prometheus_client.core import GaugeMetricFamily, REGISTRY
 from prometheus_client import start_http_server
-from typing import Optional
+from typing import Optional, List
 import time
 from ..commvault_api.client import CommvaultAPIClient
 from ..config_handler import ConfigHandler
@@ -22,15 +22,36 @@ class CommvaultCollector:
             'Whether the Commvault scrape succeeded',
             labels=[]
         )
+        
+        # System info metric
+        self.system_info = GaugeMetricFamily(
+            'commvault_info',
+            'Commvault system information',
+            labels=['version', 'commserve_name']
+        )
+
+    def _collect_system_info(self) -> None:
+        """Collect system information metrics"""
+        # TODO: Replace with actual API call when endpoint is identified
+        # Currently using placeholder values from config
+        version = self.config.get('commvault', 'version', 'unknown')
+        commserve_name = self.config.get('commvault', 'commserve_name', 'unknown')
+        
+        self.system_info.add_metric(
+            [version, commserve_name],
+            1  # Gauge value is always 1 for info metrics
+        )
 
     def collect(self):
         """Collect Prometheus metrics"""
         start_time = time.time()
         success = 0
+        metrics = []
         
         try:
-            # Perform data collection
-            metrics = []
+            # Collect system info
+            self._collect_system_info()
+            metrics.append(self.system_info)
             
             # Add scrape metrics
             metrics.append(self.scrape_success)
