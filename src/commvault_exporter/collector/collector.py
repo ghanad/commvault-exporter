@@ -46,6 +46,19 @@ class CommvaultCollector:
             labels=['job_id', 'vm_guid', 'client_name', 'job_type']
         )
 
+        # SQL Job metrics
+        self.sql_job_status = GaugeMetricFamily(
+            'commvault_sql_job_status',
+            'Status of SQL backup jobs',
+            labels=['job_id', 'instance_id', 'database_name', 'status', 'job_type']
+        )
+        
+        self.sql_job_duration = GaugeMetricFamily(
+            'commvault_sql_job_duration_seconds',
+            'Duration of SQL backup jobs in seconds',
+            labels=['job_id', 'instance_id', 'database_name', 'job_type']
+        )
+
     def _collect_system_info(self) -> None:
         """Collect system information metrics"""
         version = self.config.get('commvault', 'version', 'unknown')
@@ -54,14 +67,12 @@ class CommvaultCollector:
 
     def _collect_vsa_jobs(self) -> None:
         """Collect VSA job metrics"""
-        # Get VM GUID from config (placeholder until we implement VM discovery)
         vm_guid = self.config.get('commvault', 'vm_guid')
         if not vm_guid:
             logger.warning("No VM GUID configured - skipping VSA job collection")
             return
 
         try:
-            # Get job history for VM
             jobs = self.api_client.get(f"/v2/vsa/vm/{vm_guid}/jobs")
             if not jobs:
                 return
@@ -73,14 +84,11 @@ class CommvaultCollector:
                 client_name = job.get('clientName', 'unknown')
                 duration = float(job.get('duration', 0))
 
-                # Set job status metric (1 for success, 0 for failure)
                 status_value = 1 if status == 'completed' else 0
                 self.vsa_job_status.add_metric(
                     [job_id, vm_guid, client_name, status, job_type],
                     status_value
                 )
-
-                # Set job duration metric
                 self.vsa_job_duration.add_metric(
                     [job_id, vm_guid, client_name, job_type],
                     duration
@@ -88,6 +96,38 @@ class CommvaultCollector:
 
         except Exception as e:
             logger.error(f"Failed to collect VSA jobs: {str(e)}")
+
+    def _collect_sql_jobs(self) -> None:
+        """Collect SQL job metrics"""
+        instance_id = self.config.get('commvault', 'sql_instance_id')
+        if not instance_id:
+            logger.warning("No SQL instance ID configured - skipping SQL job collection")
+            return
+
+        try:
+            jobs = self.api_client.get(f"/v2/sql/instance/{instance_id}/history/backup")
+            if not jobs:
+                return
+
+            for job in jobs:
+                job_id = str(job.get('jobId', 'unknown'))
+                status = job.get('status', 'unknown').lower()
+                job_type = job.get('jobType', 'unknown').lower()
+                db_name = job.get('databaseName', 'unknown')
+                duration = float(job.get('duration', 0))
+
+                status_value = 1 if status == 'completed' else 0
+                self.sql_job_status.add_metric(
+                    [job_id, instance_id, db_name, status, job_type],
+                    status_value
+                )
+                self.sql_job_duration.add_metric(
+                    [job_id, instance_id, db_name, job_type],
+                    duration
+                )
+
+        except Exception as e:
+            logger.error(f"Failed to collect SQL jobs: {str(e)}")
 
     def collect(self):
         """Collect Prometheus metrics"""
@@ -104,6 +144,11 @@ class CommvaultCollector:
             self._collect_vsa_jobs()
             metrics.append(self.vsa_job_status)
             metrics.append(self.vsa_job_duration)
+            
+            # Collect SQL jobs
+            self._collect_sql_jobs()
+            metrics.append(self.sql_job_status)
+            metrics.append(self.sql_job_duration)
             
             # Add scrape metrics
             metrics.append(self.scrape_success)

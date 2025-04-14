@@ -3,6 +3,10 @@ commvault:
   username: ""
   password: ""
   auth_token: ""
+  version: "11.0"  # Placeholder - to be replaced with actual version
+  commserve_name: "cv-server"  # Placeholder - to be replaced with actual name
+  vm_guid: ""  # Placeholder - to be replaced with actual VM GUID
+  sql_instance_id: ""  # Placeholder - to be replaced with actual SQL instance ID
 exporter:
   port: 9657
   log_level: "INFO"
