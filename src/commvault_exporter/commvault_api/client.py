@@ -1,8 +1,12 @@
 import base64
 import requests
-from typing import Optional
+import logging
+from typing import Optional, Dict, Any
 from datetime import datetime, timedelta
+from urllib.parse import urljoin
 from ..config_handler import ConfigHandler
+
+logger = logging.getLogger(__name__)
 
 class CommvaultAPIClient:
     def __init__(self, config: ConfigHandler):
@@ -42,6 +46,7 @@ class CommvaultAPIClient:
             return self.auth_token
 
         except requests.exceptions.RequestException as e:
+            logger.error(f"Login failed: {str(e)}")
             raise Exception(f"Login failed: {str(e)}") from e
 
     def _is_token_valid(self) -> bool:
@@ -54,6 +59,45 @@ class CommvaultAPIClient:
             self.login()
         return self.auth_token
 
-    def refresh_token(self) -> str:
-        """Force refresh of auth token"""
-        return self.login()
+    def get(self, endpoint: str, params: Dict[str, Any] = None) -> Optional[Dict[str, Any]]:
+        """
+        Make a GET request to the Commvault API
+        Args:
+            endpoint: API endpoint path (e.g. '/v2/vsa/vm/jobs')
+            params: Optional query parameters
+        Returns:
+            Parsed JSON response or None on error
+        """
+        try:
+            # Ensure we have a valid token
+            token = self.get_auth_token()
+            
+            # Construct full URL
+            url = urljoin(self.api_url, endpoint)
+            
+            # Prepare headers
+            headers = {
+                'Authtoken': token,
+                'Accept': 'application/json'
+            }
+            
+            logger.debug(f"Making GET request to {url} with params {params}")
+            
+            # Make the request
+            response = requests.get(
+                url,
+                headers=headers,
+                params=params,
+                timeout=self.config.get('exporter', 'timeout')
+            )
+            
+            # Check for errors
+            response.raise_for_status()
+            
+            return response.json()
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"API request failed to {endpoint}: {str(e)}")
+            if hasattr(e, 'response') and e.response is not None:
+                logger.error(f"Response status: {e.response.status_code}, content: {e.response.text}")
+            return None
