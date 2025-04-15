@@ -1,29 +1,38 @@
 import logging
-from pythonjsonlogger import jsonlogger
-from typing import Dict, Any
+import os
+from logging.handlers import RotatingFileHandler
 from .config_handler import ConfigHandler
-
-class JsonFormatter(jsonlogger.JsonFormatter):
-    def add_fields(self, log_record: Dict[str, Any], record: logging.LogRecord, message_dict: Dict[str, Any]) -> None:
-        super().add_fields(log_record, record, message_dict)
-        log_record["timestamp"] = record.created
-        log_record["level"] = record.levelname
-        log_record["module"] = record.module
-        log_record["function"] = record.funcName
-        log_record["line"] = record.lineno
 
 def setup_logging(config: ConfigHandler) -> None:
     log_level = config.get("exporter", "log_level")
+    logging_config = config.get("exporter", "logging", {})
     logger = logging.getLogger()
     logger.setLevel(log_level)
 
-    handler = logging.StreamHandler()
-    formatter = JsonFormatter(
-        "%(timestamp)s %(level)s %(module)s %(function)s %(message)s"
+    # Create standard text formatter
+    formatter = logging.Formatter(
+        "%(asctime)s - %(levelname)s - %(module)s - %(funcName)s - %(message)s"
     )
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
+
+    # Add console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+
+    # Add file handler if configured
+    log_file = logging_config.get("file")
+    if log_file:
+        os.makedirs(os.path.dirname(log_file), exist_ok=True)
+        max_size = logging_config.get("max_size", 10) * 1024 * 1024  # MB to bytes
+        backup_count = logging_config.get("backup_count", 5)
+        file_handler = RotatingFileHandler(
+            log_file,
+            maxBytes=max_size,
+            backupCount=backup_count
+        )
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
 
     # Prevent duplicate logs if setup_logging is called multiple times
-    if len(logger.handlers) > 1:
-        logger.handlers = [handler]
+    if len(logger.handlers) > 2:  # Account for both console and file handlers
+        logger.handlers = logger.handlers[-2:]  # Keep last two handlers
