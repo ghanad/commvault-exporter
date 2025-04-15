@@ -15,8 +15,20 @@ class CommvaultCollector:
         if not isinstance(config, ConfigHandler):
             raise ValueError(f"Expected ConfigHandler, got {type(config)}")
         self.config = config
-        logger.debug(f"Config object contents: {self.config.config}")
         self.api_client = CommvaultAPIClient(config)
+        
+        # Add new metrics for VMPseudoClient
+        self.vm_client_status = GaugeMetricFamily(
+            'commvault_vm_client_status',
+            'Status of VM Pseudo Clients',
+            labels=['client_id', 'client_name', 'host_name', 'instance_name', 'status']
+        )
+        
+        self.vm_client_activity = GaugeMetricFamily(
+            'commvault_vm_client_activity_control',
+            'Activity control status for VM Pseudo Clients',
+            labels=['client_id', 'client_name', 'activity_type', 'enabled']
+        )
         
         # Initialize metrics
         self.scrape_duration = GaugeMetricFamily(
@@ -64,6 +76,17 @@ class CommvaultCollector:
     def _collect_system_info(self) -> None:
         """Collect system information metrics"""
         try:
+            # Temporarily add an API call here to test login
+            try:
+                endpoint = "/Client/VMPseudoClient"
+                full_url = self.api_client.get_full_url(endpoint)
+                logger.info(f"Making test API call to: {full_url}")
+                self.api_client.get(endpoint)
+                logger.info("Test API call successful (login likely worked).")
+            except Exception as api_err:
+                logger.warning(f"Test API call failed (login might have failed): {str(api_err)}")
+                # Continue anyway, as system info below relies on config
+            
             version = self.config.get('commvault', 'version', default='unknown')
             
             # Get commserve name from config
@@ -83,8 +106,10 @@ class CommvaultCollector:
             return
 
         try:
-            logger.debug(f"Starting VSA job collection for VM: {vm_guid}")
-            jobs = self.api_client.get(f"/v2/vsa/vm/{vm_guid}/jobs")
+            endpoint = f"/v2/vsa/vm/{vm_guid}/jobs"
+            full_url = self.api_client.get_full_url(endpoint)
+            logger.info(f"Making API request to: {full_url}")
+            jobs = self.api_client.get(endpoint)
             
             if not jobs:
                 logger.debug(f"No VSA jobs found for VM: {vm_guid}")
@@ -125,8 +150,10 @@ class CommvaultCollector:
             return
 
         try:
-            logger.debug(f"Starting SQL job collection for instance: {instance_id}")
-            jobs = self.api_client.get(f"/v2/sql/instance/{instance_id}/history/backup")
+            endpoint = f"/v2/sql/instance/{instance_id}/history/backup"
+            full_url = self.api_client.get_full_url(endpoint)
+            logger.info(f"Making API request to: {full_url}")
+            jobs = self.api_client.get(endpoint)
             
             if not jobs:
                 logger.debug(f"No SQL jobs found for instance: {instance_id}")
@@ -159,6 +186,53 @@ class CommvaultCollector:
             logger.error(f"SQL job collection failed for instance {instance_id}: {str(e)}")
             raise
 
+    def _collect_vm_pseudo_clients(self) -> None:
+        """Collect metrics for VM Pseudo Clients"""
+        try:
+            endpoint = "/Client/VMPseudoClient"
+            full_url = self.api_client.get_full_url(endpoint)
+            logger.info(f"Making API request to: {full_url}")
+            response = self.api_client.get(endpoint)
+            
+            if not response or 'VSPseudoClientsList' not in response:
+                logger.debug("No VM Pseudo Clients found in response")
+                return
+                
+            for client in response['VSPseudoClientsList']:
+                try:
+                    # Extract client info
+                    client_id = str(client.get('client', {}).get('clientId', 'unknown'))
+                    client_name = client.get('client', {}).get('clientName', 'unknown')
+                    host_name = client.get('client', {}).get('hostName', 'unknown')
+                    instance_name = client.get('instance', {}).get('instanceName', 'unknown')
+                    status = str(client.get('status', 'unknown'))
+                    
+                    # Add status metric
+                    status_value = 1 if status == '0' else 0  # 0 means active in Commvault
+                    self.vm_client_status.add_metric(
+                        [client_id, client_name, host_name, instance_name, status],
+                        status_value
+                    )
+                    
+                    # Add activity control metrics
+                    for activity in client.get('clientActivityControl', {}).get('activityControlOptions', []):
+                        activity_type = str(activity.get('activityType', 'unknown'))
+                        enabled = 1 if activity.get('enableActivityType', False) else 0
+                        self.vm_client_activity.add_metric(
+                            [client_id, client_name, activity_type, str(enabled)],
+                            enabled
+                        )
+                        
+                    logger.debug(f"Processed VM Pseudo Client {client_name} (ID: {client_id})")
+                except (KeyError, ValueError) as e:
+                    logger.warning(f"Skipping malformed VM Pseudo Client entry: {str(e)}")
+                    continue
+                    
+            logger.info(f"Successfully collected {len(response['VSPseudoClientsList'])} VM Pseudo Clients")
+        except Exception as e:
+            logger.error(f"VM Pseudo Client collection failed: {str(e)}")
+            raise
+
     def collect(self):
         """Collect Prometheus metrics"""
         start_time = time.time()
@@ -176,7 +250,8 @@ class CommvaultCollector:
             with concurrent.futures.ThreadPoolExecutor() as executor:
                 futures = {
                     executor.submit(self._collect_vsa_jobs): 'VSA jobs',
-                    executor.submit(self._collect_sql_jobs): 'SQL jobs'
+                    executor.submit(self._collect_sql_jobs): 'SQL jobs',
+                    executor.submit(self._collect_vm_pseudo_clients): 'VM Pseudo Clients'
                 }
                 
                 for future in concurrent.futures.as_completed(futures):
@@ -194,6 +269,8 @@ class CommvaultCollector:
                 self.vsa_job_duration,
                 self.sql_job_status,
                 self.sql_job_duration,
+                self.vm_client_status,
+                self.vm_client_activity,
                 self.scrape_success,
                 self.scrape_duration
             ])

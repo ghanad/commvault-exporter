@@ -16,8 +16,16 @@ class CommvaultAPIClient:
         self.api_url = self.config.get('commvault', 'api_url')
         self.username = self.config.get('commvault', 'username')
         self.password = self.config.get('commvault', 'password')
+        # Store base URL without path for endpoints that don't use /webconsole/api
+        self.base_url = self.api_url.split('/webconsole')[0]
         if not self.config.get('exporter', 'verify_ssl', default=True):
             logger.warning("SSL verification is disabled - using self-signed certificates")
+    
+    def get_full_url(self, endpoint: str) -> str:
+        """Get the full URL for an API endpoint"""
+        if endpoint == "Login":
+            return f"{self.api_url}/Login"
+        return urljoin(self.api_url.rstrip('/') + '/', endpoint.lstrip('/'))
 
     def login(self) -> str:
         """Authenticate with Commvault API and store auth token"""
@@ -35,8 +43,10 @@ class CommvaultAPIClient:
                 "Content-Type": "application/json",
                 "Accept": "application/json"
             }
+            full_url = f"{self.api_url}/Login"
+            logger.info(f"Making POST request to: {full_url}")
             response = requests.post(
-                f"{self.api_url}/Login",  # Correct endpoint from OpenAPI docs
+                f"{self.api_url}/Login",  # Use explicit full path for login
                 headers=headers,
                 json={
                     "username": self.username,
@@ -57,23 +67,7 @@ class CommvaultAPIClient:
             self.auth_token = data['token']
             self.token_expiry = datetime.now() + timedelta(hours=1)  # Tokens typically expire after 1 hour
             logger.info("Login successful")
-            return self.auth_token
-            if not response.text:
-                raise ValueError("Empty response from server")
-            logger.debug(f"Raw login response: {response.text}")
-            data = response.json()
-
-            if not data.get('token'):
-                error_msg = "Login response missing auth token"
-                logger.error(error_msg)
-                raise ValueError(error_msg)
-
-            self.auth_token = data['token']
-            expires_in = data.get('expires_in', 3600)
-            self.token_expiry = datetime.now() + timedelta(seconds=expires_in)
-            
-            logger.info("Login successful")
-            logger.info(f'toke: {self.auth_token}')
+            logger.info(f"token: {self.auth_token}")
             return self.auth_token
 
         except requests.exceptions.HTTPError as e:
@@ -94,6 +88,9 @@ class CommvaultAPIClient:
             error_msg = f"Invalid response format during login: {str(e)}"
             logger.error(error_msg)
             raise Exception(error_msg) from e
+        except Exception as e:
+            logger.error(f"Login failed: {str(e)}")
+            raise
 
     def _is_token_valid(self) -> bool:
         """Check if current token is valid and not expired"""
@@ -120,16 +117,16 @@ class CommvaultAPIClient:
             token = self.get_auth_token()
             
             # Construct full URL
-            url = urljoin(self.api_url, endpoint)
+            # For non-login endpoints, try both with and without /webconsole/api
+            url = urljoin(self.api_url.rstrip('/') + '/', endpoint.lstrip('/'))
+            logger.info(f'full url: {url}')
             
             # Prepare headers
             headers = {
                 'Authtoken': token,
                 'Accept': 'application/json'
             }
-            
-            logger.debug(f"Making GET request to {url} with params {params}")
-            
+                        
             # Make the request
             response = requests.get(
                 url,
@@ -138,21 +135,24 @@ class CommvaultAPIClient:
                 timeout=self.config.get('exporter', 'timeout'),
                 verify=self.config.get('exporter', 'verify_ssl', default=True)
             )
-            
+            logger.info(f'[Response]: {response.json()}')
+
             # Check for errors
             response.raise_for_status()
             
             return response.json()
             
         except requests.exceptions.HTTPError as e:
+            full_url = urljoin(self.api_url, endpoint)
             logger.error(
-                f"API request failed to {endpoint}. "
+                f"API request failed to {full_url}. "
                 f"Status: {e.response.status_code}, "
                 f"Response: {e.response.text}"
             )
             return None
         except requests.exceptions.RequestException as e:
-            logger.error(f"Request failed to {endpoint}: {str(e)}")
+            full_url = urljoin(self.api_url, endpoint)
+            logger.error(f"Request failed to {full_url}: {str(e)}")
             return None
         except ValueError as e:
             logger.error(f"Invalid JSON response from {endpoint}: {str(e)}")
