@@ -11,10 +11,14 @@ logger = logging.getLogger(__name__)
 
 class CommvaultCollector:
     def __init__(self, config: ConfigHandler):
+        logger.debug(f"Collector received config type: {type(config)}, str representation: {str(config)[:200]}")
+        if not isinstance(config, ConfigHandler):
+            raise ValueError(f"Expected ConfigHandler, got {type(config)}")
         self.config = config
+        logger.debug(f"Config object contents: {self.config.config}")
         self.api_client = CommvaultAPIClient(config)
         
-        # Initialize metrics (same as before)
+        # Initialize metrics
         self.scrape_duration = GaugeMetricFamily(
             'commvault_scrape_duration_seconds',
             'Time the Commvault scrape took',
@@ -60,8 +64,8 @@ class CommvaultCollector:
     def _collect_system_info(self) -> None:
         """Collect system information metrics"""
         try:
-            version = self.config.get('commvault', 'version', 'unknown')
-            commserve_name = self.config.get('commvault', 'commserve_name', 'unknown')
+            version = self.config.get('commvault', 'version', default='unknown')
+            commserve_name = self.config.get('commvault', 'commserve_name', default='unknown')
             self.system_info.add_metric([version, commserve_name], 1)
             logger.debug(f"Collected system info - Version: {version}, Server: {commserve_name}")
         except Exception as e:
@@ -69,8 +73,8 @@ class CommvaultCollector:
             raise
 
     def _collect_vsa_jobs(self) -> None:
-        """Collect VSA job metrics with enhanced error handling"""
-        vm_guid = self.config.get('commvault', 'vm_guid')
+        """Collect VSA job metrics"""
+        vm_guid = self.config.get('commvault', 'vm_guid', default=None)
         if not vm_guid:
             logger.warning("Skipping VSA job collection - no VM GUID configured")
             return
@@ -111,8 +115,8 @@ class CommvaultCollector:
             raise
 
     def _collect_sql_jobs(self) -> None:
-        """Collect SQL job metrics with enhanced error handling"""
-        instance_id = self.config.get('commvault', 'sql_instance_id')
+        """Collect SQL job metrics"""
+        instance_id = self.config.get('commvault', 'sql_instance_id', default=None)
         if not instance_id:
             logger.warning("Skipping SQL job collection - no instance ID configured")
             return
@@ -131,7 +135,7 @@ class CommvaultCollector:
                     status = job.get('status', 'unknown').lower()
                     job_type = job.get('jobType', 'unknown').lower()
                     db_name = job.get('databaseName', 'unknown')
-                    duration = float(job.get('duration', 0))
+                    duration = float(jog.get('duration', 0))
 
                     status_value = 1 if status == 'completed' else 0
                     self.sql_job_status.add_metric(
@@ -153,7 +157,7 @@ class CommvaultCollector:
             raise
 
     def collect(self):
-        """Collect Prometheus metrics with enhanced error handling"""
+        """Collect Prometheus metrics"""
         start_time = time.time()
         success = 0
         metrics = []
@@ -200,6 +204,11 @@ class CommvaultCollector:
         except Exception as e:
             logger.error(f"Metrics collection failed: {str(e)}")
             success = 0
+            # Return basic metrics even on failure
+            return [
+                self.scrape_success,
+                self.scrape_duration
+            ]
             
         finally:
             duration = time.time() - start_time
@@ -208,11 +217,16 @@ class CommvaultCollector:
             logger.info(f"Scrape completed in {duration:.2f} seconds (success: {success})")
 
 def start_exporter(config: ConfigHandler):
-    """Start the Prometheus exporter with enhanced logging"""
+    """Start the Prometheus exporter"""
     try:
+        logger.debug(f"start_exporter received config type: {type(config)}")
+        if not isinstance(config, ConfigHandler):
+            raise ValueError(f"Expected ConfigHandler, got {type(config)}")
+            
         logger.info("Starting Commvault exporter")
-        REGISTRY.register(CommvaultCollector(config))
-        port = config.get('exporter', 'port')
+        collector = CommvaultCollector(config)
+        REGISTRY.register(collector)
+        port = config.get('exporter', 'port', default=9657)
         start_http_server(port)
         logger.info(f"Exporter started on port {port}")
     except Exception as e:

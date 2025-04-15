@@ -1,6 +1,9 @@
 import os
 import yaml
 from typing import Dict, Any
+import logging
+
+logger = logging.getLogger(__name__)
 
 class ConfigHandler:
     def __init__(self, config_path: str = "config/config.yaml"):
@@ -56,8 +59,26 @@ class ConfigHandler:
         if os.getenv("EXPORTER_TIMEOUT"):
             self.config["exporter"]["timeout"] = int(os.getenv("EXPORTER_TIMEOUT"))
 
-    def get(self, *keys) -> Any:
-        result = self.config
-        for key in keys:
-            result = result.get(key, {})
-        return result
+    def get(self, section: str, key: str, default: Any = None) -> Any:
+        """Get a config value with optional default.
+        
+        Args:
+            section: The config section name
+            key: The key within the section
+            default: Default value if key not found
+        """
+        logger.debug(f"Config.get() called with section={section}, key={key}, default={default}")
+        logger.debug(f"Current config state: {self.config}")
+        
+        if section not in self.config:
+            logger.debug(f"Section '{section}' not found, returning default")
+            return default
+            
+        section_data = self.config[section]
+        if not isinstance(section_data, dict):
+            logger.error(f"Section '{section}' is not a dict: {type(section_data)}")
+            return default
+            
+        value = section_data.get(key, default)
+        logger.debug(f"Config.get() returning: {value}")
+        return value
