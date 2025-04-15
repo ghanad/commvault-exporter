@@ -16,6 +16,8 @@ class CommvaultAPIClient:
         self.api_url = self.config.get('commvault', 'api_url')
         self.username = self.config.get('commvault', 'username')
         self.password = self.config.get('commvault', 'password')
+        if not self.config.get('exporter', 'verify_ssl', default=True):
+            logger.warning("SSL verification is disabled - using self-signed certificates")
 
     def login(self) -> str:
         """Authenticate with Commvault API and store auth token"""
@@ -28,18 +30,37 @@ class CommvaultAPIClient:
             # Base64 encode the password
             encoded_pwd = base64.b64encode(self.password.encode()).decode()
 
-            logger.debug(f"Attempting login to {self.api_url} as {self.username}")
+            logger.info(f"Attempting login to {self.api_url} as {self.username}")
+            headers = {
+                "Content-Type": "application/json",
+                "Accept": "application/json"
+            }
             response = requests.post(
-                f"{self.api_url}/Login",
+                f"{self.api_url}/Login",  # Correct endpoint from OpenAPI docs
+                headers=headers,
                 json={
                     "username": self.username,
                     "password": encoded_pwd
                 },
-                timeout=self.config.get('exporter', 'timeout')
+                timeout=self.config.get('exporter', 'timeout'),
+                verify=self.config.get('exporter', 'verify_ssl', default=True)
             )
             
             # Check for HTTP errors
             response.raise_for_status()
+
+            # Process response and store token
+            data = response.json()
+            if not data.get('token'):
+                raise ValueError("Login response missing auth token")
+                
+            self.auth_token = data['token']
+            self.token_expiry = datetime.now() + timedelta(hours=1)  # Tokens typically expire after 1 hour
+            logger.info("Login successful")
+            return self.auth_token
+            if not response.text:
+                raise ValueError("Empty response from server")
+            logger.debug(f"Raw login response: {response.text}")
             data = response.json()
 
             if not data.get('token'):
@@ -52,17 +73,24 @@ class CommvaultAPIClient:
             self.token_expiry = datetime.now() + timedelta(seconds=expires_in)
             
             logger.info("Login successful")
+            logger.info(f'toke: {self.auth_token}')
             return self.auth_token
 
         except requests.exceptions.HTTPError as e:
-            error_msg = f"HTTP error during login: {e.response.status_code} - {e.response.text}"
+            raw_response = getattr(e.response, 'text', 'No response text available')
+            logger.debug(f"Raw error response: {raw_response}")
+            error_msg = f"HTTP error during login: {e.response.status_code} - {raw_response}"
             logger.error(error_msg)
             raise Exception(error_msg) from e
         except requests.exceptions.RequestException as e:
             error_msg = f"Request failed during login: {str(e)}"
             logger.error(error_msg)
             raise Exception(error_msg) from e
-        except (ValueError, KeyError) as e:
+        except ValueError as e:
+            if "Expecting value" in str(e):
+                raw_response = getattr(response, 'text', 'No response text available')
+                logger.error(f"Invalid JSON response. Raw content: {raw_response}")
+                raise Exception(f"Server returned invalid JSON: {raw_response}") from e
             error_msg = f"Invalid response format during login: {str(e)}"
             logger.error(error_msg)
             raise Exception(error_msg) from e
@@ -107,7 +135,8 @@ class CommvaultAPIClient:
                 url,
                 headers=headers,
                 params=params,
-                timeout=self.config.get('exporter', 'timeout')
+                timeout=self.config.get('exporter', 'timeout'),
+                verify=self.config.get('exporter', 'verify_ssl', default=True)
             )
             
             # Check for errors

@@ -65,7 +65,10 @@ class CommvaultCollector:
         """Collect system information metrics"""
         try:
             version = self.config.get('commvault', 'version', default='unknown')
+            
+            # Get commserve name from config
             commserve_name = self.config.get('commvault', 'commserve_name', default='unknown')
+            
             self.system_info.add_metric([version, commserve_name], 1)
             logger.debug(f"Collected system info - Version: {version}, Server: {commserve_name}")
         except Exception as e:
