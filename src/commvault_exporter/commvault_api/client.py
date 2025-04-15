@@ -20,12 +20,15 @@ class CommvaultAPIClient:
     def login(self) -> str:
         """Authenticate with Commvault API and store auth token"""
         if not all([self.api_url, self.username, self.password]):
-            raise ValueError("Missing required configuration for API login")
+            error_msg = "Missing required configuration for API login"
+            logger.error(error_msg)
+            raise ValueError(error_msg)
 
         try:
             # Base64 encode the password
             encoded_pwd = base64.b64encode(self.password.encode()).decode()
 
+            logger.debug(f"Attempting login to {self.api_url} as {self.username}")
             response = requests.post(
                 f"{self.api_url}/Login",
                 json={
@@ -34,20 +37,35 @@ class CommvaultAPIClient:
                 },
                 timeout=self.config.get('exporter', 'timeout')
             )
-            response.raise_for_status()
-
-            data = response.json()
-            self.auth_token = data.get('token')
             
-            # Set token expiry (default 1 hour if not provided)
+            # Check for HTTP errors
+            response.raise_for_status()
+            data = response.json()
+
+            if not data.get('token'):
+                error_msg = "Login response missing auth token"
+                logger.error(error_msg)
+                raise ValueError(error_msg)
+
+            self.auth_token = data['token']
             expires_in = data.get('expires_in', 3600)
             self.token_expiry = datetime.now() + timedelta(seconds=expires_in)
             
+            logger.info("Login successful")
             return self.auth_token
 
+        except requests.exceptions.HTTPError as e:
+            error_msg = f"HTTP error during login: {e.response.status_code} - {e.response.text}"
+            logger.error(error_msg)
+            raise Exception(error_msg) from e
         except requests.exceptions.RequestException as e:
-            logger.error(f"Login failed: {str(e)}")
-            raise Exception(f"Login failed: {str(e)}") from e
+            error_msg = f"Request failed during login: {str(e)}"
+            logger.error(error_msg)
+            raise Exception(error_msg) from e
+        except (ValueError, KeyError) as e:
+            error_msg = f"Invalid response format during login: {str(e)}"
+            logger.error(error_msg)
+            raise Exception(error_msg) from e
 
     def _is_token_valid(self) -> bool:
         """Check if current token is valid and not expired"""
@@ -56,7 +74,8 @@ class CommvaultAPIClient:
     def get_auth_token(self) -> str:
         """Get current auth token, logging in if needed or token expired"""
         if not self._is_token_valid():
-            self.login()
+            logger.debug("Auth token expired or missing - attempting login")
+            return self.login()
         return self.auth_token
 
     def get(self, endpoint: str, params: Dict[str, Any] = None) -> Optional[Dict[str, Any]]:
@@ -96,8 +115,16 @@ class CommvaultAPIClient:
             
             return response.json()
             
+        except requests.exceptions.HTTPError as e:
+            logger.error(
+                f"API request failed to {endpoint}. "
+                f"Status: {e.response.status_code}, "
+                f"Response: {e.response.text}"
+            )
+            return None
         except requests.exceptions.RequestException as e:
-            logger.error(f"API request failed to {endpoint}: {str(e)}")
-            if hasattr(e, 'response') and e.response is not None:
-                logger.error(f"Response status: {e.response.status_code}, content: {e.response.text}")
+            logger.error(f"Request failed to {endpoint}: {str(e)}")
+            return None
+        except ValueError as e:
+            logger.error(f"Invalid JSON response from {endpoint}: {str(e)}")
             return None
