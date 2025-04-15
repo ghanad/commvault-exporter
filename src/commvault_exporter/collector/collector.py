@@ -3,6 +3,7 @@ from prometheus_client import start_http_server
 from typing import Optional, List, Dict, Any
 import time
 import logging
+import concurrent.futures
 from ..commvault_api.client import CommvaultAPIClient
 from ..config_handler import ConfigHandler
 
@@ -130,29 +131,40 @@ class CommvaultCollector:
             logger.error(f"Failed to collect SQL jobs: {str(e)}")
 
     def collect(self):
-        """Collect Prometheus metrics"""
+        """Collect Prometheus metrics using concurrent execution"""
         start_time = time.time()
         success = 0
         metrics = []
         
         try:
-            # Collect system info
+            # Collect system info (runs in main thread)
             self._collect_system_info()
             metrics.append(self.system_info)
             
-            # Collect VSA jobs
-            self._collect_vsa_jobs()
-            metrics.append(self.vsa_job_status)
-            metrics.append(self.vsa_job_duration)
+            # Create thread pool for concurrent collection
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                # Submit collection tasks
+                futures = {
+                    executor.submit(self._collect_vsa_jobs): 'vsa_jobs',
+                    executor.submit(self._collect_sql_jobs): 'sql_jobs'
+                }
+                
+                # Wait for all tasks to complete
+                for future in concurrent.futures.as_completed(futures):
+                    try:
+                        future.result()
+                    except Exception as e:
+                        logger.error(f"Error in {futures[future]} collection: {str(e)}")
             
-            # Collect SQL jobs
-            self._collect_sql_jobs()
-            metrics.append(self.sql_job_status)
-            metrics.append(self.sql_job_duration)
-            
-            # Add scrape metrics
-            metrics.append(self.scrape_success)
-            metrics.append(self.scrape_duration)
+            # Add all metrics after collection is complete
+            metrics.extend([
+                self.vsa_job_status,
+                self.vsa_job_duration,
+                self.sql_job_status,
+                self.sql_job_duration,
+                self.scrape_success,
+                self.scrape_duration
+            ])
             
             # Mark as successful
             success = 1
