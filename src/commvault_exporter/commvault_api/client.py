@@ -9,7 +9,18 @@ from ..config_handler import ConfigHandler
 logger = logging.getLogger(__name__)
 
 class CommvaultAPIClient:
+    _instance = None
+    
+    def __new__(cls, config: ConfigHandler):
+        if cls._instance is None:
+            cls._instance = super(CommvaultAPIClient, cls).__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
+        
     def __init__(self, config: ConfigHandler):
+        if self._initialized:
+            return
+        self._initialized = True
         self.config = config
         self.auth_token: Optional[str] = None
         self.token_expiry: Optional[datetime] = None
@@ -135,7 +146,6 @@ class CommvaultAPIClient:
                 timeout=self.config.get('exporter', 'timeout'),
                 verify=self.config.get('exporter', 'verify_ssl', default=True)
             )
-            logger.info(f'[Response]: {response.json()}')
 
             # Check for errors
             response.raise_for_status()

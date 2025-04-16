@@ -15,6 +15,7 @@ class CommvaultCollector:
         if not isinstance(config, ConfigHandler):
             raise ValueError(f"Expected ConfigHandler, got {type(config)}")
         self.config = config
+        # Use singleton client instance
         self.api_client = CommvaultAPIClient(config)
         self._skip_first_collect = True
         
@@ -284,7 +285,17 @@ class CommvaultCollector:
                 self.vm_client_status,
                 self.vm_client_activity,
                 self.scrape_success,
-                self.scrape_duration
+                self.scrape_duration,
+                self.job_status,
+                self.job_duration,
+                self.job_start_time,
+                self.job_end_time,
+                self.job_failed_files,
+                self.job_failed_folders,
+                self.job_percent_complete,
+                self.job_size_application_bytes,
+                self.job_size_media_bytes,
+                self.job_alert_level
             ])
             
             # Mark as successful if we got this far
