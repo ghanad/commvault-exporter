@@ -16,7 +16,53 @@ class CommvaultCollector:
             raise ValueError(f"Expected ConfigHandler, got {type(config)}")
         self.config = config
         self.api_client = CommvaultAPIClient(config)
+        self._skip_first_collect = True
         
+        # Essential metrics (must always be available)
+        self.scrape_duration = GaugeMetricFamily(
+            'commvault_scrape_duration_seconds',
+            'Time the Commvault scrape took',
+            labels=[]
+        )
+        
+        self.scrape_success = GaugeMetricFamily(
+            'commvault_scrape_success',
+            'Whether the Commvault scrape succeeded',
+            labels=[]
+        )
+
+        self.system_info = GaugeMetricFamily(
+            'commvault_info',
+            'Commvault system information',
+            labels=['version', 'commserve_name']
+        )
+
+        # Old metrics (deprecated but still required)
+        self.vm_client_status = GaugeMetricFamily(
+            'commvault_vm_client_status',
+            'Status of VM Pseudo Clients',
+            labels=['client_id', 'client_name', 'host_name', 'instance_name', 'status']
+        )
+        
+        self.vm_client_activity = GaugeMetricFamily(
+            'commvault_vm_client_activity_control',
+            'Activity control status for VM Pseudo Clients',
+            labels=['client_id', 'client_name', 'activity_type', 'enabled']
+        )
+
+        self.vsa_job_status = GaugeMetricFamily(
+            'commvault_vsa_job_status',
+            'Status of VSA backup jobs',
+            labels=['job_id', 'vm_guid', 'client_name', 'status', 'job_type']
+        )
+        
+        self.vsa_job_duration = GaugeMetricFamily(
+            'commvault_vsa_job_duration_seconds',
+            'Duration of VSA backup jobs in seconds',
+            labels=['job_id', 'vm_guid', 'client_name', 'job_type']
+        )
+
+        # New job metrics
         self.job_status = GaugeMetricFamily(
             'commvault_job_status',
             'Gauge tracking job status (Completed=1, Failed=0, Running=2)',
@@ -140,8 +186,66 @@ class CommvaultCollector:
             logger.error(f"VM Pseudo Client collection failed: {str(e)}")
             raise
 
+    def _collect_job_metrics(self) -> None:
+        """Collect metrics for Commvault jobs"""
+        try:
+            endpoint = "/Job"
+            full_url = self.api_client.get_full_url(endpoint)
+            logger.info(f"Making API request to: {full_url}")
+            jobs = self.api_client.get(endpoint)
+            
+            if not jobs or 'jobs' not in jobs:
+                logger.debug("No jobs found in response")
+                return
+                
+            for job in jobs['jobs']:
+                try:
+                    job_id = str(job.get('jobSummary', {}).get('jobId', 'unknown'))
+                    job_type = job.get('jobSummary', {}).get('jobType', 'unknown').lower()
+                    client_name = job.get('jobSummary', {}).get('subclient', {}).get('clientName', 'unknown')
+                    subclient_name = job.get('jobSummary', {}).get('subclientName', 'unknown')
+                    status = job.get('jobSummary', {}).get('status', 'unknown').lower()
+                    duration = float(job.get('jobSummary', {}).get('jobElapsedTime', 0))
+                    start_time = float(job.get('jobSummary', {}).get('jobStartTime', 0))
+                    end_time = float(job.get('jobSummary', {}).get('jobEndTime', 0))
+                    failed_files = int(job.get('jobSummary', {}).get('totalFailedFiles', 0))
+                    failed_folders = int(job.get('jobSummary', {}).get('totalFailedFolders', 0))
+                    percent_complete = float(job.get('jobSummary', {}).get('percentComplete', 0))
+                    app_size = float(job.get('jobSummary', {}).get('sizeOfApplication', 0))
+                    media_size = float(job.get('jobSummary', {}).get('sizeOfMediaOnDisk', 0))
+                    alert_level = int(job.get('jobSummary', {}).get('alertColorLevel', 0))
+
+                    # Set status value (Completed=1, Failed=0, Running=2)
+                    status_value = 1 if status == 'completed' else (2 if status == 'running' else 0)
+                    
+                    # Add all metrics for this job
+                    self.job_status.add_metric([job_id, job_type, client_name, subclient_name], status_value)
+                    self.job_duration.add_metric([job_id, job_type, client_name], duration)
+                    self.job_start_time.add_metric([job_id, job_type], start_time)
+                    self.job_end_time.add_metric([job_id, job_type], end_time)
+                    self.job_failed_files.add_metric([job_id, job_type], failed_files)
+                    self.job_failed_folders.add_metric([job_id, job_type], failed_folders)
+                    self.job_percent_complete.add_metric([job_id, job_type], percent_complete)
+                    self.job_size_application_bytes.add_metric([job_id, job_type], app_size)
+                    self.job_size_media_bytes.add_metric([job_id, job_type], media_size)
+                    self.job_alert_level.add_metric([job_id, job_type], alert_level)
+                    
+                    logger.debug(f"Processed job {job_id} with status {status}")
+                except (KeyError, ValueError) as e:
+                    logger.warning(f"Skipping malformed job entry: {str(e)}")
+                    continue
+                    
+            logger.info(f"Successfully collected {len(jobs['jobs'])} jobs")
+        except Exception as e:
+            logger.error(f"Job metrics collection failed: {str(e)}")
+            raise
+
     def collect(self):
         """Collect Prometheus metrics"""
+        if self._skip_first_collect:
+            self._skip_first_collect = False
+            return []
+            
         start_time = time.time()
         success = 0
         metrics = []
@@ -156,9 +260,10 @@ class CommvaultCollector:
             # Create thread pool for concurrent collection
             with concurrent.futures.ThreadPoolExecutor() as executor:
                 futures = {
-                        executor.submit(self._collect_vsa_jobs): 'VSA jobs',
-                        executor.submit(self._collect_sql_jobs): 'SQL jobs',
-                        executor.submit(self._collect_vm_pseudo_clients): 'VM Pseudo Clients'
+                        # executor.submit(self._collect_vsa_jobs): 'VSA jobs',
+                        # executor.submit(self._collect_sql_jobs): 'SQL jobs',
+                        executor.submit(self._collect_vm_pseudo_clients): 'VM Pseudo Clients',
+                        executor.submit(self._collect_job_metrics): 'Job metrics'
                     }
                 
                 for future in concurrent.futures.as_completed(futures):
@@ -174,8 +279,8 @@ class CommvaultCollector:
             metrics.extend([
                 self.vsa_job_status,
                 self.vsa_job_duration,
-                self.sql_job_status,
-                self.sql_job_duration,
+                # self.sql_job_status,
+                # self.sql_job_duration,
                 self.vm_client_status,
                 self.vm_client_activity,
                 self.scrape_success,
@@ -244,13 +349,9 @@ def start_exporter(config: ConfigHandler):
         logger.info("Starting Commvault exporter")
         collector = CommvaultCollector(config)
         
-        # TEMPORARY: Test endpoints before starting exporter
-        # collector._test_endpoints()
-        # END TEMPORARY CODE
-        
-        REGISTRY.register(collector)
         port = config.get('exporter', 'port', default=9657)
         start_http_server(port)
+        REGISTRY.register(collector)
         logger.info(f"Exporter started on port {port}")
     except Exception as e:
         logger.error(f"Failed to start exporter: {str(e)}")
