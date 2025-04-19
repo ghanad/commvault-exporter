@@ -102,3 +102,8 @@ logs/
 
 # Windows
 Thumbs.db
+
+
+codeBase.json
+
+docs/
