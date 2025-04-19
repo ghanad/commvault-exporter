@@ -329,6 +329,7 @@ class CommvaultCollector:
         
         مثال endpoint ها:
         """
+        logger.info("++ start test_endpoints")
         endpoints_to_test = [
             # "/Client/VMPseudoClient",  # مثال: دریافت لیست مشتریان مجازی
             # "/Client",
@@ -338,14 +339,15 @@ class CommvaultCollector:
             # "/Job",
             # "/Alert",
             # "/CommServ/Health", # Not exists
-            # "/Client",
+            # "/Job",
+            "/StoragePool"
         ]
         
         for endpoint in endpoints_to_test:
             try:
                 logger.info(f"tesing endpoint: {endpoint}")
                 response = self.api_client.get(endpoint)
-                logger.info(f"response {endpoint}: {str(response)[:200]}...") 
+                logger.info(f"++response {endpoint}: {str(response)}...") 
             except Exception as e:
                 logger.error(f"error endpoint {endpoint}: {str(e)}")
         logger.info("end")

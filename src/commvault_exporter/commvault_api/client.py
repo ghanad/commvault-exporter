@@ -78,7 +78,6 @@ class CommvaultAPIClient:
             self.auth_token = data['token']
             self.token_expiry = datetime.now() + timedelta(hours=1)  # Tokens typically expire after 1 hour
             logger.info("Login successful")
-            logger.info(f"token: {self.auth_token}")
             return self.auth_token
 
         except requests.exceptions.HTTPError as e:
