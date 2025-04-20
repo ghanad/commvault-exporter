@@ -8,18 +8,16 @@ WORKDIR /app
 COPY requirements.txt .
 
 # Install dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install -r requirements.txt
 
-# Copy source code
+# Copy source code and run script
 COPY src/ ./src/
-COPY config/ ./config/
 COPY run.py .
+COPY setup.py .
 
-# Expose metrics port
-EXPOSE 9657
+EXPOSE 9658
 
-# Set environment variables
+# Environment variable (optional but can help in some cases)
 ENV PYTHONPATH=/app
 
-# Run exporter
 CMD ["python", "run.py"]

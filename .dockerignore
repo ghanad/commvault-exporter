@@ -1,0 +1,35 @@
+# Git files
+.git
+.gitignore
+
+# Python virtual environment
+venv/
+.venv/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE and OS specific files
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+
+# Local config/logs (should be mounted)
+# config/ <-- Important if you keep it local
+# logs/   <-- Important if you keep it local
+
+# Docker files themselves (less critical but good practice)
+Dockerfile
+docker-compose.yaml
+.dockerignore
+
+# Other build artifacts or test files if any
+dist/
+build/
+*.egg-info/
+tests/
+*.log # Ignore log files from local runs

@@ -1,0 +1,14 @@
+services:
+  commvault-exporter:
+    # Build the image from the Dockerfile in the current directory (.)
+    build: .
+    container_name: commvault-exporter-app 
+    restart: unless-stopped # Restart policy
+
+    ports:
+      - "9658:9658"
+
+    volumes:
+      # Mount the local config directory into the container (read-only recommended)
+      # IMPORTANT: You MUST have a ./config/config.yaml file locally relative to this docker-compose.yaml
+      - ./config:/app/config:ro
