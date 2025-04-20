@@ -1,129 +1,76 @@
 from prometheus_client.core import GaugeMetricFamily, CounterMetricFamily, REGISTRY, CollectorRegistry
-# Import generate_latest function AND the CONTENT_TYPE_LATEST constant
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
-from typing import List, Dict, Any, Optional, Iterable
+from typing import List, Dict, Any, Optional, Iterable, Tuple
 import time
 import logging
 import concurrent.futures
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer # Consider ThreadingHTTPServer if needed
+# from http.server import ThreadingHTTPServer # Use this for concurrent request handling
 from urllib.parse import urlparse, parse_qs
 import functools
 import threading
-import sys # For sys.exit
+import sys
+from datetime import datetime # Import datetime
 
-# Import necessary classes (adjust paths if needed)
+# Import necessary classes
 from ..commvault_api.client import CommvaultAPIClient
 from ..config_handler import ConfigHandler
 
 logger = logging.getLogger(__name__)
 
-# --- Metric Definitions Helper ---
+# --- Global Token Cache ---
+# Stores { 'target_name': (token_string, expiry_datetime), ... }
+TARGET_TOKEN_CACHE: Dict[str, Tuple[str, datetime]] = {}
+CACHE_LOCK = threading.Lock() # Lock for thread-safe access to the cache
+
+# --- Metric Definitions Helper (no changes) ---
 def add_target_label(metric_family_class, name, documentation, labels):
-    """Helper to add 'commvault_target' to the labels list."""
     if 'commvault_target' not in labels:
         labels.append('commvault_target')
     return metric_family_class(name, documentation, labels=labels)
 
-# --- CommvaultCollector Class ---
+# --- CommvaultCollector Class (no changes) ---
+# ... (Keep the CommvaultCollector class exactly as it was in the previous version) ...
 class CommvaultCollector:
     """
     Collects metrics for a specific Commvault target.
     An instance of this collector is created per probe request.
     """
     def __init__(self, target_name: str, target_config: Dict[str, Any]):
-        """
-        Initializes the collector for a specific target.
-
-        Args:
-            target_name: The name of the target (used as label value).
-            target_config: The configuration dictionary for this target.
-        """
         logger.debug(f"Initializing collector for target: {target_name}")
         if not target_config:
              raise ValueError(f"Target configuration for '{target_name}' is missing or empty.")
-
         self.target_name = target_name
         self.target_config = target_config
-        self.api_client: Optional[CommvaultAPIClient] = None # Client is initialized separately
+        # Pass target_name to the API client constructor
+        self.api_client: Optional[CommvaultAPIClient] = None
 
         # --- Define Metrics ---
-        self.scrape_duration = add_target_label(
-            GaugeMetricFamily, 'commvault_scrape_duration_seconds',
-            'Time the Commvault scrape took for this target', []
-        )
-        self.scrape_success = add_target_label(
-            GaugeMetricFamily, 'commvault_scrape_success',
-            'Whether the Commvault scrape succeeded for this target (1 for success, 0 for failure)', []
-        )
-        self.system_info = add_target_label(
-            GaugeMetricFamily, 'commvault_info',
-            'Commvault system information for this target', ['version', 'commserve_name']
-        )
-        self.vm_client_status = add_target_label(
-            GaugeMetricFamily, 'commvault_vm_client_status',
-            'Status of VM Pseudo Clients', ['client_id', 'client_name', 'host_name', 'instance_name', 'status']
-        )
-        self.vm_client_activity = add_target_label(
-            GaugeMetricFamily, 'commvault_vm_client_activity_control',
-            'Activity control status for VM Pseudo Clients', ['client_id', 'client_name', 'activity_type', 'enabled']
-        )
-        self.job_status = add_target_label(
-            GaugeMetricFamily, 'commvault_job_status',
-            'Gauge tracking job status (Completed=1, Failed=0, Running=2, Other=3)',
-            ['jobId', 'jobType', 'clientName', 'subclientName']
-        )
-        self.job_duration = add_target_label(
-            GaugeMetricFamily, 'commvault_job_duration_seconds',
-            'Gauge measuring job duration in seconds',
-            ['jobId', 'jobType', 'clientName']
-        )
-        self.job_start_time = add_target_label(
-            GaugeMetricFamily, 'commvault_job_start_time_seconds',
-            'Gauge for job start time (Unix timestamp)',
-            ['jobId', 'jobType']
-        )
-        self.job_end_time = add_target_label(
-            GaugeMetricFamily, 'commvault_job_end_time_seconds',
-            'Gauge for job end time (Unix timestamp)',
-            ['jobId', 'jobType']
-        )
-        self.job_failed_files = add_target_label(
-            GaugeMetricFamily, 'commvault_job_failed_files_total',
-            'Gauge for the number of failed files in the last job run', # Changed doc slightly
-            ['jobId', 'jobType']
-        )
-        self.job_failed_folders = add_target_label(
-            GaugeMetricFamily, 'commvault_job_failed_folders_total',
-            'Gauge for the number of failed folders in the last job run', # Changed doc slightly
-            ['jobId', 'jobType']
-        )
-        self.job_percent_complete = add_target_label(
-            GaugeMetricFamily, 'commvault_job_percent_complete',
-            'Gauge for job completion percentage (0-100)',
-            ['jobId', 'jobType']
-        )
-        self.job_size_application_bytes = add_target_label(
-            GaugeMetricFamily, 'commvault_job_size_application_bytes',
-            'Gauge for the size of the application data processed (bytes)',
-            ['jobId', 'jobType']
-        )
-        self.job_size_media_bytes = add_target_label(
-            GaugeMetricFamily, 'commvault_job_size_media_bytes',
-            'Gauge for the size of media on disk (bytes)',
-            ['jobId', 'jobType']
-        )
-        self.job_alert_level = add_target_label(
-            GaugeMetricFamily, 'commvault_job_alert_level',
-            'Gauge for alert severity (0=normal, higher=issues)',
-            ['jobId', 'jobType']
-        )
+        # (Metrics definitions remain the same)
+        self.scrape_duration = add_target_label(GaugeMetricFamily,'commvault_scrape_duration_seconds','Time the Commvault scrape took for this target', [])
+        self.scrape_success = add_target_label(GaugeMetricFamily,'commvault_scrape_success','Whether the Commvault scrape succeeded for this target (1 for success, 0 for failure)', [])
+        self.system_info = add_target_label(GaugeMetricFamily,'commvault_info','Commvault system information for this target', ['version', 'commserve_name'])
+        self.vm_client_status = add_target_label(GaugeMetricFamily,'commvault_vm_client_status','Status of VM Pseudo Clients', ['client_id', 'client_name', 'host_name', 'instance_name', 'status'])
+        self.vm_client_activity = add_target_label(GaugeMetricFamily,'commvault_vm_client_activity_control','Activity control status for VM Pseudo Clients', ['client_id', 'client_name', 'activity_type', 'enabled'])
+        self.job_status = add_target_label(GaugeMetricFamily,'commvault_job_status','Gauge tracking job status (Completed=1, Failed=0, Running=2, Other=3)', ['jobId', 'jobType', 'clientName', 'subclientName'])
+        self.job_duration = add_target_label(GaugeMetricFamily,'commvault_job_duration_seconds','Gauge measuring job duration in seconds', ['jobId', 'jobType', 'clientName'])
+        self.job_start_time = add_target_label(GaugeMetricFamily,'commvault_job_start_time_seconds','Gauge for job start time (Unix timestamp)', ['jobId', 'jobType'])
+        self.job_end_time = add_target_label(GaugeMetricFamily,'commvault_job_end_time_seconds','Gauge for job end time (Unix timestamp)', ['jobId', 'jobType'])
+        self.job_failed_files = add_target_label(GaugeMetricFamily,'commvault_job_failed_files_total','Gauge for the number of failed files in the last job run', ['jobId', 'jobType'])
+        self.job_failed_folders = add_target_label(GaugeMetricFamily,'commvault_job_failed_folders_total','Gauge for the number of failed folders in the last job run', ['jobId', 'jobType'])
+        self.job_percent_complete = add_target_label(GaugeMetricFamily,'commvault_job_percent_complete','Gauge for job completion percentage (0-100)', ['jobId', 'jobType'])
+        self.job_size_application_bytes = add_target_label(GaugeMetricFamily,'commvault_job_size_application_bytes','Gauge for the size of the application data processed (bytes)', ['jobId', 'jobType'])
+        self.job_size_media_bytes = add_target_label(GaugeMetricFamily,'commvault_job_size_media_bytes','Gauge for the size of media on disk (bytes)', ['jobId', 'jobType'])
+        self.job_alert_level = add_target_label(GaugeMetricFamily,'commvault_job_alert_level','Gauge for alert severity (0=normal, higher=issues)', ['jobId', 'jobType'])
+
 
     def initialize_client(self) -> None:
         """Instantiates the API client for this collector instance."""
         if not self.api_client:
             logger.debug(f"Creating API client for target {self.target_name}")
             try:
-                self.api_client = CommvaultAPIClient(self.target_config)
+                # Pass target_name to the client constructor
+                self.api_client = CommvaultAPIClient(self.target_name, self.target_config)
                 logger.info(f"API client initialized successfully for target {self.target_name}")
             except Exception as e:
                 logger.error(f"Failed to initialize API client for target {self.target_name}: {e}")
@@ -134,7 +81,8 @@ class CommvaultCollector:
         """Helper to add the target name as the last label value."""
         metric_family.add_metric(labels + [self.target_name], value)
 
-    # --- Data Collection Methods ---
+    # --- Data Collection Methods (_collect_system_info, etc.) ---
+    # (No changes needed in these methods)
     def _collect_system_info(self) -> None:
         if not self.api_client: return
         try:
@@ -247,69 +195,59 @@ class CommvaultCollector:
         start_time = time.time()
         overall_success = True # Assume success initially
 
-        # --- Step 1: Ensure API Client is initialized (should already be by handler) ---
         if not self.api_client:
             logger.error(f"[{self.target_name}] Collect called but API client is not initialized.")
             overall_success = False
-            # Yield basic failure metrics immediately
             duration = time.time() - start_time
             self._add_metric_with_target(self.scrape_duration, [], duration)
             self._add_metric_with_target(self.scrape_success, [], 0)
             yield self.scrape_duration
             yield self.scrape_success
-            return # Stop collection
+            return
 
         logger.info(f"[{self.target_name}] Starting metrics collection")
 
-        # --- Step 2: Perform login *before* starting concurrent tasks ---
+        # --- Ensure Authentication (Login only if needed) ---
         try:
-            logger.debug(f"[{self.target_name}] Ensuring authentication token is valid before concurrent collection.")
-            # This call will trigger login() if token is missing or expired
+            logger.debug(f"[{self.target_name}] Ensuring authentication token is valid before collection.")
+            # get_auth_token() now checks cache first, then logs in if necessary
             self.api_client.get_auth_token()
             logger.debug(f"[{self.target_name}] Authentication token is ready.")
         except Exception as auth_exc:
-            logger.error(f"[{self.target_name}] Initial authentication failed: {auth_exc}")
+            logger.error(f"[{self.target_name}] Authentication failed: {auth_exc}")
             overall_success = False
-            # Skip concurrent collection if login fails
+            # Skip concurrent collection if auth fails
 
-        # --- Step 3: Run Collection Tasks Concurrently (only if login succeeded) ---
+        # --- Run Collection Tasks Concurrently (only if auth succeeded) ---
         if overall_success:
             collection_tasks = {
-                # System info is quick, can run sequentially or concurrently
                 self._collect_system_info: "System Info",
                 self._collect_vm_pseudo_clients: "VM Pseudo Clients",
                 self._collect_job_metrics: "Job Metrics",
-                # Add other collection methods here
             }
-
             try:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
                      future_to_task = {executor.submit(task): name for task, name in collection_tasks.items()}
                      for future in concurrent.futures.as_completed(future_to_task):
                          task_name = future_to_task[future]
                          try:
-                             future.result() # Raise exception if task failed
+                             future.result()
                              logger.debug(f"[{self.target_name}] Task '{task_name}' completed successfully.")
                          except Exception as exc:
                              logger.error(f"[{self.target_name}] Task '{task_name}' failed: {exc}")
-                             overall_success = False # Mark scrape as failed if any task fails
+                             overall_success = False
             except Exception as e:
                  logger.error(f"[{self.target_name}] Error during concurrent collection execution: {e}")
                  overall_success = False
 
-
-        # --- Step 4: Yield Metrics ---
+        # --- Yield Metrics ---
         duration = time.time() - start_time
         self._add_metric_with_target(self.scrape_duration, [], duration)
         self._add_metric_with_target(self.scrape_success, [], 1 if overall_success else 0)
         logger.info(f"[{self.target_name}] Scrape completed in {duration:.2f} seconds (success: {overall_success})")
 
-        # Always yield scrape metrics
         yield self.scrape_duration
         yield self.scrape_success
-
-        # Yield other collected metrics (they might be empty if collection failed, which is fine)
-        # Check if metric family has samples before yielding might be cleaner but adds overhead
         yield self.system_info
         yield self.vm_client_status
         yield self.vm_client_activity
@@ -323,25 +261,20 @@ class CommvaultCollector:
         yield self.job_size_application_bytes
         yield self.job_size_media_bytes
         yield self.job_alert_level
-        # Yield other metric families here...
 
 
-# --- Probe HTTP Handler ---
+# --- Probe HTTP Handler (No changes needed) ---
+# ... (Keep the ProbeHandler class exactly as it was in the previous version) ...
 class ProbeHandler(BaseHTTPRequestHandler):
     """
     Handles HTTP requests to the /probe endpoint.
     Creates a temporary collector for the specific target requested.
     """
     def __init__(self, config: ConfigHandler, *args, **kwargs):
-        """
-        Initializes the handler with the global configuration.
-        'config' is passed via functools.partial during server setup.
-        """
         self.config = config
         super().__init__(*args, **kwargs)
 
     def do_GET(self):
-        """Handles GET requests."""
         url = urlparse(self.path)
         if url.path != '/probe':
             self.send_response(404)
@@ -379,15 +312,13 @@ class ProbeHandler(BaseHTTPRequestHandler):
 
         try:
             collector = CommvaultCollector(target_name, target_config)
+            # initialize_client creates the API client instance internally
             collector.initialize_client()
             registry.register(collector)
 
-            # Generate metrics using the temporary registry and collector instance
             output = generate_latest(registry)
 
-            # Send success response
             self.send_response(200)
-            # Use the directly imported constant here
             self.send_header('Content-Type', CONTENT_TYPE_LATEST)
             self.end_headers()
             self.wfile.write(output)
@@ -395,23 +326,24 @@ class ProbeHandler(BaseHTTPRequestHandler):
 
         except Exception as e:
             error_message = f"Failed to probe target '{target_name}': {str(e)}"
-            logger.exception(error_message) # Log full traceback for debugging
+            logger.exception(error_message)
             self.send_response(500)
             self.send_header('Content-Type', 'text/plain')
             self.end_headers()
             self.wfile.write(error_message.encode('utf-8'))
 
 
-# --- Exporter Start Function ---
-
+# --- Exporter Start Function (No changes needed) ---
+# ... (Keep start_http_server and start_exporter functions as they were) ...
 def start_http_server(config: ConfigHandler):
     """Starts the single HTTP server for the /probe endpoint."""
     port = config.get_exporter_port()
     logger.info(f"Starting exporter HTTP server on port {port} for /probe endpoint")
-
     handler = functools.partial(ProbeHandler, config)
     server = None
     try:
+        # Consider using ThreadingHTTPServer for potentially better concurrency handling
+        # server = ThreadingHTTPServer(('', port), handler)
         server = HTTPServer(('', port), handler)
         server.serve_forever()
     except OSError as e:
@@ -428,15 +360,12 @@ def start_http_server(config: ConfigHandler):
             server.shutdown()
         raise
 
-
 def start_exporter(config: ConfigHandler):
     """
     Initializes and starts the exporter's HTTP server.
     """
     if not isinstance(config, ConfigHandler):
         raise ValueError(f"start_exporter requires a ConfigHandler instance, got {type(config)}")
-
     if not config.get_all_targets():
         logger.warning("No targets defined in configuration. Server will start but /probe requests will fail to find targets.")
-
     start_http_server(config)

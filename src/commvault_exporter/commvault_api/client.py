@@ -1,27 +1,49 @@
 import base64
 import requests
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple # Added Tuple
 from datetime import datetime, timedelta
 from urllib.parse import urljoin
-# Note: No longer importing ConfigHandler here directly, pass config dict
+import threading # Import threading for lock access
+
+# Import the global cache and lock from the collector module
+# Use a relative import to avoid circular dependency issues if possible,
+# otherwise structure might need slight adjustment.
+# Assuming collector.py is one level up in the directory structure:
+# from ..collector.collector import TARGET_TOKEN_CACHE, CACHE_LOCK
+# If that causes issues, consider passing the cache/lock or using a separate cache module.
+# For simplicity here, we'll assume direct import works or structure allows it.
+# **Important**: If direct import causes issues, this needs restructuring.
+# Let's try without direct import first and handle cache access differently.
 
 logger = logging.getLogger(__name__)
 
-class CommvaultAPIClient:
-    # Removed Singleton pattern (__new__, _instance, _initialized checks)
+# --- Placeholder for Cache Access ---
+# We need a way for the client to update the cache. Passing functions or the cache itself
+# during initialization is one way. Let's try passing update/check functions.
 
-    def __init__(self, target_config: Dict[str, Any]):
+# Define function types for clarity
+CacheCheckFunc = Optional[callable] # Should accept target_name, return Optional[Tuple[str, datetime]]
+CacheUpdateFunc = Optional[callable] # Should accept target_name, token, expiry_dt
+
+class CommvaultAPIClient:
+
+    
+    def __init__(self, target_name: str, target_config: Dict[str, Any]):
         """
         Initializes a new API client instance for a specific target configuration.
 
         Args:
+            target_name: The name of the target this client connects to.
             target_config: A dictionary containing the specific configuration
                            for the target (api_url, username, password, etc.).
         """
         if not target_config:
             raise ValueError("Target configuration dictionary cannot be empty")
+        if not target_name:
+            raise ValueError("Target name cannot be empty")
 
+        self.target_name = target_name # Store target name
         self.target_config = target_config
         self.auth_token: Optional[str] = None
         self.token_expiry: Optional[datetime] = None
@@ -30,135 +52,173 @@ class CommvaultAPIClient:
         self.api_url = self.target_config.get('api_url')
         self.username = self.target_config.get('username')
         self.password = self.target_config.get('password')
-        self.timeout = self.target_config.get('timeout', 30) # Default timeout if not in dict
-        self.verify_ssl = self.target_config.get('verify_ssl', True) # Default to verify
+        self.timeout = self.target_config.get('timeout', 30)
+        self.verify_ssl = self.target_config.get('verify_ssl', True)
 
         if not all([self.api_url, self.username, self.password]):
             missing = [k for k in ['api_url', 'username', 'password'] if not self.target_config.get(k)]
-            raise ValueError(f"Missing required keys in target configuration: {missing}")
+            raise ValueError(f"Target '{self.target_name}': Missing required keys in target configuration: {missing}")
 
-        # Store base URL without path for endpoints that don't use /webconsole/api
-        # Handle potential case where api_url doesn't contain '/webconsole'
         if '/webconsole' in self.api_url:
              self.base_url = self.api_url.split('/webconsole')[0]
         else:
-             # Assume the provided URL is the base if '/webconsole' is missing
-             # Or handle as an error if '/webconsole/api' structure is mandatory
              self.base_url = self.api_url.rstrip('/')
-             logger.warning(f"API URL '{self.api_url}' does not contain '/webconsole'. "
-                            f"Assuming it's the base URL. Login might require adjustments.")
-
+             logger.warning(f"Target '{self.target_name}': API URL '{self.api_url}' does not contain '/webconsole'. Assuming base URL.")
 
         if not self.verify_ssl:
-            logger.warning(f"SSL verification is disabled for target with API URL {self.api_url}")
-            # Suppress InsecureRequestWarning for this specific client instance if possible
-            # Note: requests.packages.urllib3.disable_warnings is global, so avoid if possible.
-            # Better to handle this per-request if verify=False is used.
+            logger.warning(f"Target '{self.target_name}': SSL verification is disabled for API URL {self.api_url}")
 
 
     def get_full_url(self, endpoint: str) -> str:
         """Get the full URL for an API endpoint relative to this target's api_url."""
-        # Ensure api_url ends with / before joining
         base_api = self.api_url.rstrip('/') + '/'
         return urljoin(base_api, endpoint.lstrip('/'))
 
-    def login(self) -> str:
-        """Authenticate with Commvault API for this target and store auth token."""
-        # Credentials already checked in __init__
+    
+    def login(self) -> Tuple[str, datetime]:
+        """
+        Authenticate with Commvault API for this target.
 
+        Returns:
+            Tuple (auth_token, expiry_time) on successful login.
+
+        Raises:
+            Exception: If login fails for any reason.
+        """
         try:
-            # Base64 encode the password
             encoded_pwd = base64.b64encode(self.password.encode()).decode()
-
-            # Use the existing helper method which handles trailing slashes correctly
             login_url = self.get_full_url("Login")
-            logger.info(f"Attempting login to {login_url} as {self.username}")
+            logger.info(f"Target '{self.target_name}': Attempting login to {login_url} as {self.username}")
 
-            headers = {
-                "Content-Type": "application/json",
-                "Accept": "application/json"
-            }
-
+            headers = { "Content-Type": "application/json", "Accept": "application/json" }
             response = requests.post(
-                login_url, # Use the correctly formed URL
+                login_url,
                 headers=headers,
-                json={
-                    "username": self.username,
-                    "password": encoded_pwd
-                },
+                json={"username": self.username, "password": encoded_pwd },
                 timeout=self.timeout,
                 verify=self.verify_ssl
             )
-
-            response.raise_for_status() # Check for HTTP errors (4xx, 5xx)
-
+            response.raise_for_status()
             data = response.json()
             token = data.get('token')
 
-            # Some API versions might return 'token' or 'tokenValue' or similar
-            if not token and 'userName' in data: # Check if response looks like a successful login response
-                 token = data.get('token') # Try again, maybe structure varies
+            if not token and 'userName' in data:
+                 token = data.get('token')
                  if not token:
-                     # Look inside 'consoles' array which is another common pattern
                      consoles = data.get('consoles', [])
                      if consoles and isinstance(consoles, list) and len(consoles) > 0:
                           token = consoles[0].get('token')
 
             if not token:
-                logger.error(f"Login response missing auth token for {login_url}. Response: {response.text[:500]}")
+                logger.error(f"Target '{self.target_name}': Login response missing auth token from {login_url}. Response: {response.text[:500]}")
                 raise ValueError(f"Login response missing auth token for {login_url}")
 
-            self.auth_token = token
-            # Set expiry slightly less than typical token lifetime (often 1 hour)
-            self.token_expiry = datetime.now() + timedelta(minutes=55)
-            logger.info(f"Login successful for {login_url}")
-            return self.auth_token
+            # Calculate expiry time (e.g., 55 minutes from now)
+            expiry_dt = datetime.now() + timedelta(minutes=55)
+            logger.info(f"Target '{self.target_name}': Login successful. Token expires around {expiry_dt}.")
+            logger.info(f'token: {token}')
+            # Return the token and expiry time
+            return token, expiry_dt
 
         except requests.exceptions.HTTPError as e:
             raw_response = getattr(e.response, 'text', 'No response text available')
             status_code = getattr(e.response, 'status_code', 'N/A')
-            error_msg = f"HTTP error {status_code} during login to {login_url}: {raw_response[:500]}"
+            error_msg = f"Target '{self.target_name}': HTTP error {status_code} during login to {login_url}: {raw_response[:500]}"
             logger.error(error_msg)
-            # Consider raising a more specific exception type if needed elsewhere
             raise Exception(error_msg) from e
         except requests.exceptions.RequestException as e:
-            error_msg = f"Request failed during login to {login_url}: {str(e)}"
+            error_msg = f"Target '{self.target_name}': Request failed during login to {login_url}: {str(e)}"
             logger.error(error_msg)
             raise Exception(error_msg) from e
-        except ValueError as e: # Handles JSONDecodeError as well
-            # Check if response exists before trying to access text
-            raw_response = getattr(response, 'text', 'No response object or text available')
+        except ValueError as e:
+            raw_response = getattr(response, 'text', 'No response object or text available') if 'response' in locals() else 'N/A'
             if "Expecting value" in str(e) or isinstance(e, requests.exceptions.JSONDecodeError):
-                logger.error(f"Invalid JSON response during login to {login_url}. Raw content: {raw_response[:500]}")
+                logger.error(f"Target '{self.target_name}': Invalid JSON response during login to {login_url}. Raw content: {raw_response[:500]}")
                 raise Exception(f"Server at {login_url} returned invalid JSON: {raw_response[:500]}") from e
-            # Reraise other ValueErrors (like missing token)
-            error_msg = f"Data error during login to {login_url}: {str(e)}"
+            error_msg = f"Target '{self.target_name}': Data error during login to {login_url}: {str(e)}"
             logger.error(error_msg)
             raise Exception(error_msg) from e
         except Exception as e:
-            logger.error(f"Unexpected error during login to {login_url}: {str(e)}")
-            raise # Re-raise the original exception
+            logger.error(f"Target '{self.target_name}': Unexpected error during login to {login_url}: {str(e)}", exc_info=True)
+            raise
 
-    def _is_token_valid(self) -> bool:
-        """Check if current token is valid and not expired for this instance."""
-        return self.auth_token and self.token_expiry and self.token_expiry > datetime.now()
+    def _is_token_valid(self, token: Optional[str], expiry: Optional[datetime]) -> bool:
+        """Check if a given token/expiry pair is valid."""
+        return token and expiry and expiry > datetime.now()
 
+    
     def get_auth_token(self) -> str:
-        """Get current auth token, logging in if needed or token expired for this instance."""
-        if not self._is_token_valid():
-            logger.info(f"Auth token invalid or expired for {self.api_url} - attempting login")
-            try:
-                 return self.login()
-            except Exception as e:
-                 logger.error(f"Failed to refresh token for {self.api_url}: {e}")
-                 # Decide if we should clear the token or just raise
-                 self.auth_token = None
-                 self.token_expiry = None
-                 raise # Re-raise the exception from login()
-        # If token is valid, log its presence just for debugging if needed
-        # logger.debug(f"Using existing valid auth token for {self.api_url}")
-        return self.auth_token # Should always be non-None if no exception was raised
+        """
+        Get current auth token for this target.
+        Checks local instance -> global cache -> performs login if needed.
+        Updates global cache on successful login.
+        """
+        # 1. Check local instance variable first
+        if self._is_token_valid(self.auth_token, self.token_expiry):
+            logger.debug(f"Target '{self.target_name}': Using valid token from instance.")
+            return self.auth_token
 
+        # 2. Check global cache (thread-safe)
+        cached_token: Optional[str] = None
+        cached_expiry: Optional[datetime] = None
+        try:
+            # Access cache defined in collector module
+            from ..collector.collector import TARGET_TOKEN_CACHE, CACHE_LOCK
+            with CACHE_LOCK:
+                if self.target_name in TARGET_TOKEN_CACHE:
+                    cached_token, cached_expiry = TARGET_TOKEN_CACHE[self.target_name]
+                    logger.debug(f"Target '{self.target_name}': Found token in cache. Expiry: {cached_expiry}")
+                else:
+                     logger.debug(f"Target '{self.target_name}': No token found in cache.")
+
+            # Validate the cached token
+            if self._is_token_valid(cached_token, cached_expiry):
+                logger.info(f"Target '{self.target_name}': Using valid token found in global cache.")
+                # Update local instance variables from cache
+                self.auth_token = cached_token
+                self.token_expiry = cached_expiry
+                return self.auth_token
+            elif cached_token: # Cache exists but is expired
+                 logger.info(f"Target '{self.target_name}': Token found in cache but has expired ({cached_expiry}).")
+
+        except ImportError:
+             logger.error("Could not import TARGET_TOKEN_CACHE, CACHE_LOCK. Token caching disabled.")
+        except Exception as e:
+             logger.error(f"Error accessing token cache: {e}", exc_info=True)
+
+
+        # 3. If no valid token locally or in cache, perform login
+        logger.info(f"Target '{self.target_name}': No valid token available, proceeding with login.")
+        try:
+            new_token, new_expiry = self.login() # login now returns a tuple
+
+            # Update local instance variables
+            self.auth_token = new_token
+            self.token_expiry = new_expiry
+
+            # Update global cache (thread-safe)
+            try:
+                from ..collector.collector import TARGET_TOKEN_CACHE, CACHE_LOCK
+                with CACHE_LOCK:
+                    logger.debug(f"Target '{self.target_name}': Updating global cache with new token expiring at {new_expiry}.")
+                    TARGET_TOKEN_CACHE[self.target_name] = (new_token, new_expiry)
+            except ImportError:
+                 logger.error("Could not import TARGET_TOKEN_CACHE, CACHE_LOCK. Failed to update cache.")
+            except Exception as e:
+                 logger.error(f"Error updating token cache: {e}", exc_info=True)
+
+
+            return self.auth_token
+
+        except Exception as login_exc:
+            # Login failed, ensure local token is invalidated
+            self.auth_token = None
+            self.token_expiry = None
+            # Log the error and re-raise to signal failure
+            logger.error(f"Target '{self.target_name}': Failed to obtain new token via login: {login_exc}")
+            raise login_exc # Re-raise the exception from login()
+
+    
     def get(self, endpoint: str, params: Dict[str, Any] = None) -> Optional[Dict[str, Any]]:
         """
         Make a GET request to the Commvault API for this target.
@@ -170,17 +230,13 @@ class CommvaultAPIClient:
         Returns:
             Parsed JSON response dictionary or None on error.
         """
-        full_url = None # Initialize for logging in except blocks
+        full_url = None
         try:
-            token = self.get_auth_token() # Ensures login happens if needed
-            full_url = self.get_full_url(endpoint) # Use helper for all endpoints
-            logger.debug(f"Making GET request to: {full_url}")
+            token = self.get_auth_token() # This now handles cache/login logic
+            full_url = self.get_full_url(endpoint)
+            logger.debug(f"Target '{self.target_name}': Making GET request to: {full_url}")
 
-            headers = {
-                'Authtoken': token,
-                'Accept': 'application/json'
-            }
-
+            headers = { 'Authtoken': token, 'Accept': 'application/json' }
             response = requests.get(
                 full_url,
                 headers=headers,
@@ -188,40 +244,28 @@ class CommvaultAPIClient:
                 timeout=self.timeout,
                 verify=self.verify_ssl
             )
+            response.raise_for_status()
 
-            response.raise_for_status() # Check for HTTP errors
-
-            # Handle potential empty success response (e.g., 204 No Content)
             if response.status_code == 204 or not response.content:
-                 logger.debug(f"Received empty successful response (status {response.status_code}) from {full_url}")
-                 return {} # Return empty dict for consistency, or None if preferred
+                 logger.debug(f"Target '{self.target_name}': Received empty successful response (status {response.status_code}) from {full_url}")
+                 return {}
 
             return response.json()
 
-        except requests.exceptions.HTTPError as e:
-            status_code = getattr(e.response, 'status_code', 'N/A')
-            response_text = getattr(e.response, 'text', 'No response text')[:500]
-            # Ensure full_url was assigned before error
-            url_for_log = full_url if full_url else f"{self.api_url}/{endpoint.lstrip('/')}"
-            logger.error(
-                f"API GET request failed to {url_for_log}. "
-                f"Status: {status_code}, "
-                f"Response: {response_text}"
-            )
-            # Optionally, re-raise or return a specific error indicator
-            return None
-        except requests.exceptions.RequestException as e:
-            # Network errors, timeouts, DNS errors etc.
-            url_for_log = full_url if full_url else f"{self.api_url}/{endpoint.lstrip('/')}"
-            logger.error(f"Request failed for {url_for_log}: {str(e)}")
-            return None
-        except ValueError as e: # Handles JSONDecodeError
-            raw_response = getattr(response, 'text', 'No response object or text available')
-            url_for_log = full_url if full_url else f"{self.api_url}/{endpoint.lstrip('/')}"
-            logger.error(f"Invalid JSON response from {url_for_log}: {str(e)}. Response: {raw_response[:500]}")
-            return None
         except Exception as e:
-            # Catch potential errors from get_auth_token() or other unexpected issues
+            # Catch potential errors from get_auth_token() or requests
             url_for_log = full_url if full_url else f"{self.api_url}/{endpoint.lstrip('/')}"
-            logger.error(f"Unexpected error during GET request to {endpoint} for {url_for_log}: {str(e)}")
-            return None
+            # Avoid logging the token itself in case of error
+            if isinstance(e, requests.exceptions.HTTPError):
+                 status_code = getattr(e.response, 'status_code', 'N/A')
+                 response_text = getattr(e.response, 'text', 'No response text')[:500]
+                 logger.error(f"Target '{self.target_name}': API GET request failed to {url_for_log}. Status: {status_code}, Response: {response_text}")
+            elif isinstance(e, requests.exceptions.RequestException):
+                 logger.error(f"Target '{self.target_name}': Request failed for {url_for_log}: {str(e)}")
+            elif isinstance(e, ValueError): # JSONDecodeError
+                 raw_response = getattr(response, 'text', 'No response object or text available') if 'response' in locals() else 'N/A'
+                 logger.error(f"Target '{self.target_name}': Invalid JSON response from {url_for_log}: {str(e)}. Response: {raw_response[:500]}")
+            else:
+                 # Catch errors from get_auth_token (like login failure) or others
+                 logger.error(f"Target '{self.target_name}': Unexpected error during GET request to {endpoint} for {url_for_log}: {str(e)}")
+            return None # Return None on any exception during GET
