@@ -238,52 +238,78 @@ class CommvaultCollector:
         except Exception as e:
             logger.error(f"[{self.target_name}] Job metrics collection failed: {str(e)}")
 
+
     def collect(self) -> Iterable[GaugeMetricFamily]:
         """
         Collects all metrics for the target. Called by Prometheus client library.
-        Orchestrates calls to the specific _collect_* methods.
+        Ensures login happens once before concurrent collection.
         """
+        start_time = time.time()
+        overall_success = True # Assume success initially
+
+        # --- Step 1: Ensure API Client is initialized (should already be by handler) ---
         if not self.api_client:
             logger.error(f"[{self.target_name}] Collect called but API client is not initialized.")
+            overall_success = False
+            # Yield basic failure metrics immediately
+            duration = time.time() - start_time
+            self._add_metric_with_target(self.scrape_duration, [], duration)
             self._add_metric_with_target(self.scrape_success, [], 0)
-            self._add_metric_with_target(self.scrape_duration, [], 0)
-            yield self.scrape_success
             yield self.scrape_duration
-            return
+            yield self.scrape_success
+            return # Stop collection
 
-        start_time = time.time()
-        overall_success = True
         logger.info(f"[{self.target_name}] Starting metrics collection")
 
-        collection_tasks = {
-            self._collect_system_info: "System Info",
-            self._collect_vm_pseudo_clients: "VM Pseudo Clients",
-            self._collect_job_metrics: "Job Metrics",
-        }
-
+        # --- Step 2: Perform login *before* starting concurrent tasks ---
         try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-                 future_to_task = {executor.submit(task): name for task, name in collection_tasks.items()}
-                 for future in concurrent.futures.as_completed(future_to_task):
-                     task_name = future_to_task[future]
-                     try:
-                         future.result()
-                         logger.debug(f"[{self.target_name}] Task '{task_name}' completed successfully.")
-                     except Exception as exc:
-                         logger.error(f"[{self.target_name}] Task '{task_name}' failed: {exc}")
-                         overall_success = False
-        except Exception as e:
-             logger.error(f"[{self.target_name}] Error during concurrent collection execution: {e}")
-             overall_success = False
+            logger.debug(f"[{self.target_name}] Ensuring authentication token is valid before concurrent collection.")
+            # This call will trigger login() if token is missing or expired
+            self.api_client.get_auth_token()
+            logger.debug(f"[{self.target_name}] Authentication token is ready.")
+        except Exception as auth_exc:
+            logger.error(f"[{self.target_name}] Initial authentication failed: {auth_exc}")
+            overall_success = False
+            # Skip concurrent collection if login fails
 
+        # --- Step 3: Run Collection Tasks Concurrently (only if login succeeded) ---
+        if overall_success:
+            collection_tasks = {
+                # System info is quick, can run sequentially or concurrently
+                self._collect_system_info: "System Info",
+                self._collect_vm_pseudo_clients: "VM Pseudo Clients",
+                self._collect_job_metrics: "Job Metrics",
+                # Add other collection methods here
+            }
+
+            try:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+                     future_to_task = {executor.submit(task): name for task, name in collection_tasks.items()}
+                     for future in concurrent.futures.as_completed(future_to_task):
+                         task_name = future_to_task[future]
+                         try:
+                             future.result() # Raise exception if task failed
+                             logger.debug(f"[{self.target_name}] Task '{task_name}' completed successfully.")
+                         except Exception as exc:
+                             logger.error(f"[{self.target_name}] Task '{task_name}' failed: {exc}")
+                             overall_success = False # Mark scrape as failed if any task fails
+            except Exception as e:
+                 logger.error(f"[{self.target_name}] Error during concurrent collection execution: {e}")
+                 overall_success = False
+
+
+        # --- Step 4: Yield Metrics ---
         duration = time.time() - start_time
         self._add_metric_with_target(self.scrape_duration, [], duration)
         self._add_metric_with_target(self.scrape_success, [], 1 if overall_success else 0)
         logger.info(f"[{self.target_name}] Scrape completed in {duration:.2f} seconds (success: {overall_success})")
 
-        # Yield all metrics that were populated
+        # Always yield scrape metrics
         yield self.scrape_duration
         yield self.scrape_success
+
+        # Yield other collected metrics (they might be empty if collection failed, which is fine)
+        # Check if metric family has samples before yielding might be cleaner but adds overhead
         yield self.system_info
         yield self.vm_client_status
         yield self.vm_client_activity
@@ -297,6 +323,7 @@ class CommvaultCollector:
         yield self.job_size_application_bytes
         yield self.job_size_media_bytes
         yield self.job_alert_level
+        # Yield other metric families here...
 
 
 # --- Probe HTTP Handler ---
