@@ -61,3 +61,21 @@ exporter:
     max_size: 10
     # Optional: Number of backup log files to keep
     backup_count: 5
+
+
+
+# Prometheus Job
+```yaml
+  - job_name: 'commvault_probe'
+    metrics_path: /probe
+    static_configs:
+      - targets:
+        - commvault-api
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: commvault_exporter:9657
+```
