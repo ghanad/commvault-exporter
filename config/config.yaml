@@ -1,12 +1,12 @@
-commvault:
-  api_url: ""
-  username: ""
-  password: ""
-  auth_token: ""
-  version: "11.0"  # Placeholder - to be replaced with actual version
-  commserve_name: "cv-server"  # Placeholder - to be replaced with actual name
-  vm_guid: ""  # Placeholder - to be replaced with actual VM GUID
-  sql_instance_id: ""  # Placeholder - to be replaced with actual SQL instance ID
+# Multi-target configuration example
+targets:
+  172.17.207.19:
+    api_url: "https://commvault-api/webconsole/api"
+    username: "user"
+    password: "password"
+    verify_ssl: false
+
+
 exporter:
   port: 9657
   log_level: "INFO"

@@ -1,12 +1,11 @@
 services:
   commvault-exporter:
-    # Build the image from the Dockerfile in the current directory (.)
-    build: .
+    image: commvault_exporter:v1.0
     container_name: commvault-exporter-app 
-    restart: unless-stopped # Restart policy
+    restart: unless-stopped
 
     ports:
-      - "9658:9658"
+      - "9657:9657"
 
     volumes:
       # Mount the local config directory into the container (read-only recommended)
