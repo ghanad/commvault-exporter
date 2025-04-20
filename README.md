@@ -61,7 +61,7 @@ exporter:
     max_size: 10
     # Optional: Number of backup log files to keep
     backup_count: 5
-
+```
 
 
 # Prometheus Job
