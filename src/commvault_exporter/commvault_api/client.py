@@ -116,7 +116,6 @@ class CommvaultAPIClient:
             # Calculate expiry time (e.g., 55 minutes from now)
             expiry_dt = datetime.now() + timedelta(minutes=55)
             logger.info(f"Target '{self.target_name}': Login successful. Token expires around {expiry_dt}.")
-            logger.info(f'token: {token}')
             # Return the token and expiry time
             return token, expiry_dt
 
