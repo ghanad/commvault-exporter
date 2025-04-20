@@ -1,371 +1,415 @@
-from prometheus_client.core import GaugeMetricFamily, REGISTRY
-from prometheus_client import start_http_server
-from typing import List, Dict, Any
+from prometheus_client.core import GaugeMetricFamily, CounterMetricFamily, REGISTRY, CollectorRegistry
+# Import generate_latest function AND the CONTENT_TYPE_LATEST constant
+from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+from typing import List, Dict, Any, Optional, Iterable
 import time
 import logging
 import concurrent.futures
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import urlparse, parse_qs
+import functools
+import threading
+import sys # For sys.exit
+
+# Import necessary classes (adjust paths if needed)
 from ..commvault_api.client import CommvaultAPIClient
 from ..config_handler import ConfigHandler
 
 logger = logging.getLogger(__name__)
 
+# --- Metric Definitions Helper ---
+def add_target_label(metric_family_class, name, documentation, labels):
+    """Helper to add 'commvault_target' to the labels list."""
+    if 'commvault_target' not in labels:
+        labels.append('commvault_target')
+    return metric_family_class(name, documentation, labels=labels)
+
+# --- CommvaultCollector Class ---
 class CommvaultCollector:
-    def __init__(self, config: ConfigHandler):
-        logger.debug(f"Collector received config type: {type(config)}, str representation: {str(config)[:200]}")
-        if not isinstance(config, ConfigHandler):
-            raise ValueError(f"Expected ConfigHandler, got {type(config)}")
-        self.config = config
-        # Use singleton client instance
-        self.api_client = CommvaultAPIClient(config)
-        self._skip_first_collect = True
-        
-        # Essential metrics (must always be available)
-        self.scrape_duration = GaugeMetricFamily(
-            'commvault_scrape_duration_seconds',
-            'Time the Commvault scrape took',
-            labels=[]
-        )
-        
-        self.scrape_success = GaugeMetricFamily(
-            'commvault_scrape_success',
-            'Whether the Commvault scrape succeeded',
-            labels=[]
-        )
+    """
+    Collects metrics for a specific Commvault target.
+    An instance of this collector is created per probe request.
+    """
+    def __init__(self, target_name: str, target_config: Dict[str, Any]):
+        """
+        Initializes the collector for a specific target.
 
-        self.system_info = GaugeMetricFamily(
-            'commvault_info',
-            'Commvault system information',
-            labels=['version', 'commserve_name']
-        )
+        Args:
+            target_name: The name of the target (used as label value).
+            target_config: The configuration dictionary for this target.
+        """
+        logger.debug(f"Initializing collector for target: {target_name}")
+        if not target_config:
+             raise ValueError(f"Target configuration for '{target_name}' is missing or empty.")
 
-        # Old metrics (deprecated but still required)
-        self.vm_client_status = GaugeMetricFamily(
-            'commvault_vm_client_status',
-            'Status of VM Pseudo Clients',
-            labels=['client_id', 'client_name', 'host_name', 'instance_name', 'status']
-        )
-        
-        self.vm_client_activity = GaugeMetricFamily(
-            'commvault_vm_client_activity_control',
-            'Activity control status for VM Pseudo Clients',
-            labels=['client_id', 'client_name', 'activity_type', 'enabled']
-        )
+        self.target_name = target_name
+        self.target_config = target_config
+        self.api_client: Optional[CommvaultAPIClient] = None # Client is initialized separately
 
-        self.vsa_job_status = GaugeMetricFamily(
-            'commvault_vsa_job_status',
-            'Status of VSA backup jobs',
-            labels=['job_id', 'vm_guid', 'client_name', 'status', 'job_type']
+        # --- Define Metrics ---
+        self.scrape_duration = add_target_label(
+            GaugeMetricFamily, 'commvault_scrape_duration_seconds',
+            'Time the Commvault scrape took for this target', []
         )
-        
-        self.vsa_job_duration = GaugeMetricFamily(
-            'commvault_vsa_job_duration_seconds',
-            'Duration of VSA backup jobs in seconds',
-            labels=['job_id', 'vm_guid', 'client_name', 'job_type']
+        self.scrape_success = add_target_label(
+            GaugeMetricFamily, 'commvault_scrape_success',
+            'Whether the Commvault scrape succeeded for this target (1 for success, 0 for failure)', []
         )
-
-        # New job metrics
-        self.job_status = GaugeMetricFamily(
-            'commvault_job_status',
-            'Gauge tracking job status (Completed=1, Failed=0, Running=2)',
-            labels=['jobId', 'jobType', 'clientName', 'subclientName']
+        self.system_info = add_target_label(
+            GaugeMetricFamily, 'commvault_info',
+            'Commvault system information for this target', ['version', 'commserve_name']
         )
-
-        self.job_duration = GaugeMetricFamily(
-            'commvault_job_duration_seconds',
+        self.vm_client_status = add_target_label(
+            GaugeMetricFamily, 'commvault_vm_client_status',
+            'Status of VM Pseudo Clients', ['client_id', 'client_name', 'host_name', 'instance_name', 'status']
+        )
+        self.vm_client_activity = add_target_label(
+            GaugeMetricFamily, 'commvault_vm_client_activity_control',
+            'Activity control status for VM Pseudo Clients', ['client_id', 'client_name', 'activity_type', 'enabled']
+        )
+        self.job_status = add_target_label(
+            GaugeMetricFamily, 'commvault_job_status',
+            'Gauge tracking job status (Completed=1, Failed=0, Running=2, Other=3)',
+            ['jobId', 'jobType', 'clientName', 'subclientName']
+        )
+        self.job_duration = add_target_label(
+            GaugeMetricFamily, 'commvault_job_duration_seconds',
             'Gauge measuring job duration in seconds',
-            labels=['jobId', 'jobType', 'clientName']
+            ['jobId', 'jobType', 'clientName']
         )
-
-        self.job_start_time = GaugeMetricFamily(
-            'commvault_job_start_time',
+        self.job_start_time = add_target_label(
+            GaugeMetricFamily, 'commvault_job_start_time_seconds',
             'Gauge for job start time (Unix timestamp)',
-            labels=['jobId', 'jobType']
+            ['jobId', 'jobType']
         )
-
-        self.job_end_time = GaugeMetricFamily(
-            'commvault_job_end_time',
+        self.job_end_time = add_target_label(
+            GaugeMetricFamily, 'commvault_job_end_time_seconds',
             'Gauge for job end time (Unix timestamp)',
-            labels=['jobId', 'jobType']
+            ['jobId', 'jobType']
         )
-
-        self.job_failed_files = GaugeMetricFamily(
-            'commvault_job_failed_files',
-            'Counter for the number of failed files in a job',
-            labels=['jobId', 'jobType']
+        self.job_failed_files = add_target_label(
+            GaugeMetricFamily, 'commvault_job_failed_files_total',
+            'Gauge for the number of failed files in the last job run', # Changed doc slightly
+            ['jobId', 'jobType']
         )
-
-        self.job_failed_folders = GaugeMetricFamily(
-            'commvault_job_failed_folders',
-            'Counter for the number of failed folders in a job',
-            labels=['jobId', 'jobType']
+        self.job_failed_folders = add_target_label(
+            GaugeMetricFamily, 'commvault_job_failed_folders_total',
+            'Gauge for the number of failed folders in the last job run', # Changed doc slightly
+            ['jobId', 'jobType']
         )
-
-        self.job_percent_complete = GaugeMetricFamily(
-            'commvault_job_percent_complete',
+        self.job_percent_complete = add_target_label(
+            GaugeMetricFamily, 'commvault_job_percent_complete',
             'Gauge for job completion percentage (0-100)',
-            labels=['jobId', 'jobType']
+            ['jobId', 'jobType']
         )
-
-        self.job_size_application_bytes = GaugeMetricFamily(
-            'commvault_job_size_application_bytes',
+        self.job_size_application_bytes = add_target_label(
+            GaugeMetricFamily, 'commvault_job_size_application_bytes',
             'Gauge for the size of the application data processed (bytes)',
-            labels=['jobId', 'jobType']
+            ['jobId', 'jobType']
         )
-
-        self.job_size_media_bytes = GaugeMetricFamily(
-            'commvault_job_size_media_bytes',
+        self.job_size_media_bytes = add_target_label(
+            GaugeMetricFamily, 'commvault_job_size_media_bytes',
             'Gauge for the size of media on disk (bytes)',
-            labels=['jobId', 'jobType']
+            ['jobId', 'jobType']
         )
-
-        self.job_alert_level = GaugeMetricFamily(
-            'commvault_job_alert_level',
+        self.job_alert_level = add_target_label(
+            GaugeMetricFamily, 'commvault_job_alert_level',
             'Gauge for alert severity (0=normal, higher=issues)',
-            labels=['jobId', 'jobType']
+            ['jobId', 'jobType']
         )
 
-    def _collect_system_info(self) -> None:
-        """Collect system information metrics"""
-        try:
-            
-            version = self.config.get('commvault', 'version', default='unknown')
-            
-            # Get commserve name from config
-            commserve_name = self.config.get('commvault', 'commserve_name', default='unknown')
-            
-            self.system_info.add_metric([version, commserve_name], 1)
-            logger.debug(f"Collected system info - Version: {version}, Server: {commserve_name}")
-        except Exception as e:
-            logger.error(f"Failed to collect system info: {str(e)}")
-            raise
+    def initialize_client(self) -> None:
+        """Instantiates the API client for this collector instance."""
+        if not self.api_client:
+            logger.debug(f"Creating API client for target {self.target_name}")
+            try:
+                self.api_client = CommvaultAPIClient(self.target_config)
+                logger.info(f"API client initialized successfully for target {self.target_name}")
+            except Exception as e:
+                logger.error(f"Failed to initialize API client for target {self.target_name}: {e}")
+                self.api_client = None
+                raise
 
+    def _add_metric_with_target(self, metric_family, labels: List[str], value: float):
+        """Helper to add the target name as the last label value."""
+        metric_family.add_metric(labels + [self.target_name], value)
+
+    # --- Data Collection Methods ---
+    def _collect_system_info(self) -> None:
+        if not self.api_client: return
+        try:
+            version = self.target_config.get('version', 'unknown')
+            commserve_name = self.target_config.get('commserve_name', self.target_name)
+            self._add_metric_with_target(self.system_info, [version, commserve_name], 1)
+            logger.debug(f"[{self.target_name}] Collected system info - Version: {version}, Server: {commserve_name}")
+        except Exception as e:
+            logger.error(f"[{self.target_name}] Failed to collect system info: {str(e)}")
 
     def _collect_vm_pseudo_clients(self) -> None:
-        """Collect metrics for VM Pseudo Clients"""
+        if not self.api_client: return
         try:
-            endpoint = "/Client/VMPseudoClient"
-            full_url = self.api_client.get_full_url(endpoint)
-            logger.info(f"Making API request to: {full_url}")
-            response = self.api_client.get(endpoint)
-            
+            endpoint_to_try = "/Client/VMPseudoClient"
+            logger.info(f"[{self.target_name}] Making API request to: {endpoint_to_try}")
+            response = self.api_client.get(endpoint_to_try)
             if not response or 'VSPseudoClientsList' not in response:
-                logger.debug("No VM Pseudo Clients found in response")
-                return
-                
-            for client in response['VSPseudoClientsList']:
+                 logger.debug(f"[{self.target_name}] No 'VSPseudoClientsList' found in response from {endpoint_to_try}.")
+                 return
+            count = 0
+            for client in response.get('VSPseudoClientsList', []):
                 try:
-                    # Extract client info
-                    client_id = str(client.get('client', {}).get('clientId', 'unknown'))
-                    client_name = client.get('client', {}).get('clientName', 'unknown')
-                    host_name = client.get('client', {}).get('hostName', 'unknown')
+                    client_entity = client.get('client', {}).get('clientEntity', client.get('client', {}))
+                    client_id = str(client_entity.get('clientId', 'unknown'))
+                    client_name = client_entity.get('clientName', 'unknown')
+                    host_name = client_entity.get('hostName', 'unknown')
                     instance_name = client.get('instance', {}).get('instanceName', 'unknown')
-                    status = str(client.get('status', 'unknown'))
-                    
-                    # Add status metric
-                    status_value = 1 if status == '0' else 0  # 0 means active in Commvault
-                    self.vm_client_status.add_metric(
-                        [client_id, client_name, host_name, instance_name, status],
-                        status_value
+                    status_code = str(client.get('statusInfo', {}).get('status', client.get('status', 'unknown')))
+                    status_str = client.get('statusInfo', {}).get('statusString', status_code)
+                    status_value = 1 if status_code in ['0', '1'] or status_str.lower() == 'configured' else 0
+                    self._add_metric_with_target(
+                        self.vm_client_status, [client_id, client_name, host_name, instance_name, status_str], status_value
                     )
-                    
-                    # Add activity control metrics
                     for activity in client.get('clientActivityControl', {}).get('activityControlOptions', []):
                         activity_type = str(activity.get('activityType', 'unknown'))
                         enabled = 1 if activity.get('enableActivityType', False) else 0
-                        self.vm_client_activity.add_metric(
-                            [client_id, client_name, activity_type, str(enabled)],
-                            enabled
+                        self._add_metric_with_target(
+                            self.vm_client_activity, [client_id, client_name, activity_type, str(enabled)], enabled
                         )
-                        
-                    logger.debug(f"Processed VM Pseudo Client {client_name} (ID: {client_id})")
-                except (KeyError, ValueError) as e:
-                    logger.warning(f"Skipping malformed VM Pseudo Client entry: {str(e)}")
-                    continue
-                    
-            logger.info(f"Successfully collected {len(response['VSPseudoClientsList'])} VM Pseudo Clients")
+                    count += 1
+                except (AttributeError, KeyError, ValueError, TypeError) as e:
+                    logger.warning(f"[{self.target_name}] Skipping malformed VM Pseudo Client entry: {e}. Data: {str(client)[:200]}")
+            logger.info(f"[{self.target_name}] Successfully processed {count} VM Pseudo Clients")
         except Exception as e:
-            logger.error(f"VM Pseudo Client collection failed: {str(e)}")
-            raise
+            logger.error(f"[{self.target_name}] VM Pseudo Client collection failed: {str(e)}")
 
     def _collect_job_metrics(self) -> None:
-        """Collect metrics for Commvault jobs"""
+        if not self.api_client: return
         try:
             endpoint = "/Job"
-            full_url = self.api_client.get_full_url(endpoint)
-            logger.info(f"Making API request to: {full_url}")
-            jobs = self.api_client.get(endpoint)
-            
-            if not jobs or 'jobs' not in jobs:
-                logger.debug("No jobs found in response")
+            params = {'completed': 'true', 'lookupFinishedJobs': 'true', 'allProps': 'true', 'limit': 1000} # Added limit
+            logger.info(f"[{self.target_name}] Making API request to: {endpoint} with params: {params}")
+            response = self.api_client.get(endpoint, params=params)
+            if not response or 'jobs' not in response:
+                logger.debug(f"[{self.target_name}] No 'jobs' key found in response from {endpoint}.")
                 return
-                
-            for job in jobs['jobs']:
+            count = 0
+            for job in response.get('jobs', []):
                 try:
-                    job_id = str(job.get('jobSummary', {}).get('jobId', 'unknown'))
-                    job_type = job.get('jobSummary', {}).get('jobType', 'unknown').lower()
-                    client_name = job.get('jobSummary', {}).get('subclient', {}).get('clientName', 'unknown')
-                    subclient_name = job.get('jobSummary', {}).get('subclientName', 'unknown')
-                    status = job.get('jobSummary', {}).get('status', 'unknown').lower()
-                    duration = float(job.get('jobSummary', {}).get('jobElapsedTime', 0))
-                    start_time = float(job.get('jobSummary', {}).get('jobStartTime', 0))
-                    end_time = float(job.get('jobSummary', {}).get('jobEndTime', 0))
-                    failed_files = int(job.get('jobSummary', {}).get('totalFailedFiles', 0))
-                    failed_folders = int(job.get('jobSummary', {}).get('totalFailedFolders', 0))
-                    percent_complete = float(job.get('jobSummary', {}).get('percentComplete', 0))
-                    app_size = float(job.get('jobSummary', {}).get('sizeOfApplication', 0))
-                    media_size = float(job.get('jobSummary', {}).get('sizeOfMediaOnDisk', 0))
-                    alert_level = int(job.get('jobSummary', {}).get('alertColorLevel', 0))
+                    summary = job.get('jobSummary', {})
+                    if not summary: continue
+                    job_id = str(summary.get('jobId', 'unknown'))
+                    job_type = summary.get('jobType', 'unknown').replace(" ", "_").lower()
+                    client_entity = summary.get('clientEntity', summary.get('client', {}))
+                    client_name = client_entity.get('clientName', 'unknown')
+                    subclient_info = summary.get('subclient', {})
+                    subclient_name = subclient_info.get('subclientName', 'unknown')
+                    status = summary.get('status', 'unknown').lower()
+                    duration = float(summary.get('jobElapsedTime', 0))
+                    start_time = float(summary.get('jobStartTime', 0))
+                    end_time = float(summary.get('jobEndTime', 0))
+                    failed_files = int(summary.get('totalFailedFiles', 0))
+                    failed_folders = int(summary.get('totalFailedFolders', 0))
+                    percent_complete = float(summary.get('percentComplete', 0))
+                    app_size = float(summary.get('sizeOfApplication', 0))
+                    media_size = float(summary.get('sizeOfMediaOnDisk', 0))
+                    alert_level = int(summary.get('alertColorLevel', summary.get('severity', 0)))
 
-                    # Set status value (Completed=1, Failed=0, Running=2)
-                    status_value = 1 if status == 'completed' else (2 if status == 'running' else 0)
-                    
-                    # Add all metrics for this job
-                    self.job_status.add_metric([job_id, job_type, client_name, subclient_name], status_value)
-                    self.job_duration.add_metric([job_id, job_type, client_name], duration)
-                    self.job_start_time.add_metric([job_id, job_type], start_time)
-                    self.job_end_time.add_metric([job_id, job_type], end_time)
-                    self.job_failed_files.add_metric([job_id, job_type], failed_files)
-                    self.job_failed_folders.add_metric([job_id, job_type], failed_folders)
-                    self.job_percent_complete.add_metric([job_id, job_type], percent_complete)
-                    self.job_size_application_bytes.add_metric([job_id, job_type], app_size)
-                    self.job_size_media_bytes.add_metric([job_id, job_type], media_size)
-                    self.job_alert_level.add_metric([job_id, job_type], alert_level)
-                    
-                    logger.debug(f"Processed job {job_id} with status {status}")
-                except (KeyError, ValueError) as e:
-                    logger.warning(f"Skipping malformed job entry: {str(e)}")
-                    continue
-                    
-            logger.info(f"Successfully collected {len(jobs['jobs'])} jobs")
+                    if status in ['completed']: status_value = 1
+                    elif status in ['running', 'waiting', 'pending', 'queued', 'suspended']: status_value = 2
+                    elif status in ['failed', 'killed', 'completed w/ errors', 'completed w/ warnings', 'no run']: status_value = 0
+                    else: status_value = 3
+
+                    labels_status = [job_id, job_type, client_name, subclient_name]
+                    self._add_metric_with_target(self.job_status, labels_status, status_value)
+                    labels_duration = [job_id, job_type, client_name]
+                    self._add_metric_with_target(self.job_duration, labels_duration, duration)
+                    labels_common = [job_id, job_type]
+                    self._add_metric_with_target(self.job_start_time, labels_common, start_time)
+                    self._add_metric_with_target(self.job_end_time, labels_common, end_time)
+                    self._add_metric_with_target(self.job_failed_files, labels_common, failed_files)
+                    self._add_metric_with_target(self.job_failed_folders, labels_common, failed_folders)
+                    self._add_metric_with_target(self.job_percent_complete, labels_common, percent_complete)
+                    self._add_metric_with_target(self.job_size_application_bytes, labels_common, app_size)
+                    self._add_metric_with_target(self.job_size_media_bytes, labels_common, media_size)
+                    self._add_metric_with_target(self.job_alert_level, labels_common, alert_level)
+                    count += 1
+                except (AttributeError, KeyError, ValueError, TypeError) as e:
+                    logger.warning(f"[{self.target_name}] Skipping malformed job entry: {e}. Data: {str(job)[:200]}")
+            logger.info(f"[{self.target_name}] Successfully processed {count} jobs from {endpoint}")
         except Exception as e:
-            logger.error(f"Job metrics collection failed: {str(e)}")
-            raise
+            logger.error(f"[{self.target_name}] Job metrics collection failed: {str(e)}")
 
-    def collect(self):
-        """Collect Prometheus metrics"""
-        if self._skip_first_collect:
-            self._skip_first_collect = False
-            return []
-            
+    def collect(self) -> Iterable[GaugeMetricFamily]:
+        """
+        Collects all metrics for the target. Called by Prometheus client library.
+        Orchestrates calls to the specific _collect_* methods.
+        """
+        if not self.api_client:
+            logger.error(f"[{self.target_name}] Collect called but API client is not initialized.")
+            self._add_metric_with_target(self.scrape_success, [], 0)
+            self._add_metric_with_target(self.scrape_duration, [], 0)
+            yield self.scrape_success
+            yield self.scrape_duration
+            return
+
         start_time = time.time()
-        success = 0
-        metrics = []
-        
-        try:
-            logger.info("Starting metrics collection")
-            
-            # Collect system info (runs in main thread)
-            self._collect_system_info()
-            metrics.append(self.system_info)
-            
-            # Create thread pool for concurrent collection
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                futures = {
-                        # executor.submit(self._collect_vsa_jobs): 'VSA jobs',
-                        # executor.submit(self._collect_sql_jobs): 'SQL jobs',
-                        executor.submit(self._collect_vm_pseudo_clients): 'VM Pseudo Clients',
-                        executor.submit(self._collect_job_metrics): 'Job metrics'
-                    }
-                
-                for future in concurrent.futures.as_completed(futures):
-                    task_name = futures[future]
-                    try:
-                        future.result()
-                        logger.debug(f"{task_name} collection completed successfully")
-                    except Exception as e:
-                        logger.error(f"{task_name} collection failed: {str(e)}")
-                        success = 0  # Mark as failed if any collection fails
-            
-            # Add all metrics after collection is complete
-            metrics.extend([
-                self.vsa_job_status,
-                self.vsa_job_duration,
-                # self.sql_job_status,
-                # self.sql_job_duration,
-                self.vm_client_status,
-                self.vm_client_activity,
-                self.scrape_success,
-                self.scrape_duration,
-                self.job_status,
-                self.job_duration,
-                self.job_start_time,
-                self.job_end_time,
-                self.job_failed_files,
-                self.job_failed_folders,
-                self.job_percent_complete,
-                self.job_size_application_bytes,
-                self.job_size_media_bytes,
-                self.job_alert_level
-            ])
-            
-            # Mark as successful if we got this far
-            success = 1
-            logger.info("Metrics collection completed successfully")
-            
-            return metrics
-            
-        except Exception as e:
-            logger.error(f"Metrics collection failed: {str(e)}")
-            success = 0
-            # Return basic metrics even on failure
-            return [
-                self.scrape_success,
-                self.scrape_duration
-            ]
-            
-        finally:
-            duration = time.time() - start_time
-            self.scrape_duration.add_metric([], duration)
-            self.scrape_success.add_metric([], success)
-            logger.info(f"Scrape completed in {duration:.2f} seconds (success: {success})")
+        overall_success = True
+        logger.info(f"[{self.target_name}] Starting metrics collection")
 
-    def _test_endpoints(self) -> None:
+        collection_tasks = {
+            self._collect_system_info: "System Info",
+            self._collect_vm_pseudo_clients: "VM Pseudo Clients",
+            self._collect_job_metrics: "Job Metrics",
+        }
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+                 future_to_task = {executor.submit(task): name for task, name in collection_tasks.items()}
+                 for future in concurrent.futures.as_completed(future_to_task):
+                     task_name = future_to_task[future]
+                     try:
+                         future.result()
+                         logger.debug(f"[{self.target_name}] Task '{task_name}' completed successfully.")
+                     except Exception as exc:
+                         logger.error(f"[{self.target_name}] Task '{task_name}' failed: {exc}")
+                         overall_success = False
+        except Exception as e:
+             logger.error(f"[{self.target_name}] Error during concurrent collection execution: {e}")
+             overall_success = False
+
+        duration = time.time() - start_time
+        self._add_metric_with_target(self.scrape_duration, [], duration)
+        self._add_metric_with_target(self.scrape_success, [], 1 if overall_success else 0)
+        logger.info(f"[{self.target_name}] Scrape completed in {duration:.2f} seconds (success: {overall_success})")
+
+        # Yield all metrics that were populated
+        yield self.scrape_duration
+        yield self.scrape_success
+        yield self.system_info
+        yield self.vm_client_status
+        yield self.vm_client_activity
+        yield self.job_status
+        yield self.job_duration
+        yield self.job_start_time
+        yield self.job_end_time
+        yield self.job_failed_files
+        yield self.job_failed_folders
+        yield self.job_percent_complete
+        yield self.job_size_application_bytes
+        yield self.job_size_media_bytes
+        yield self.job_alert_level
+
+
+# --- Probe HTTP Handler ---
+class ProbeHandler(BaseHTTPRequestHandler):
+    """
+    Handles HTTP requests to the /probe endpoint.
+    Creates a temporary collector for the specific target requested.
+    """
+    def __init__(self, config: ConfigHandler, *args, **kwargs):
         """
-        روش استفاده از این تابع موقت:
-        1. لیست endpoint های مورد نظر خود را در آرایه زیر اضافه کنید
-        2. exporter را به صورت معمولی اجرا کنید
-        3. خروجی را در فایل لاگ بررسی کنید
-        4. بعد از اتمام تست، این تابع را حذف کنید
-        
-        مثال endpoint ها:
+        Initializes the handler with the global configuration.
+        'config' is passed via functools.partial during server setup.
         """
-        logger.info("++ start test_endpoints")
-        endpoints_to_test = [
-            # "/Client/VMPseudoClient",  # مثال: دریافت لیست مشتریان مجازی
-            # "/Client",
-            # "/StoragePolicy",
-            # "/MediaAgent",
-            # "/VM",
-            # "/Job",
-            # "/Alert",
-            # "/CommServ/Health", # Not exists
-            # "/Job",
-            "/StoragePool"
-        ]
-        
-        for endpoint in endpoints_to_test:
-            try:
-                logger.info(f"tesing endpoint: {endpoint}")
-                response = self.api_client.get(endpoint)
-                logger.info(f"++response {endpoint}: {str(response)}...") 
-            except Exception as e:
-                logger.error(f"error endpoint {endpoint}: {str(e)}")
-        logger.info("end")
+        self.config = config
+        super().__init__(*args, **kwargs)
+
+    def do_GET(self):
+        """Handles GET requests."""
+        url = urlparse(self.path)
+        if url.path != '/probe':
+            self.send_response(404)
+            self.send_header('Content-Type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b"Not Found: Use the /probe?target=... endpoint")
+            return
+
+        query_params = parse_qs(url.query)
+        target_list = query_params.get('target', [])
+
+        if not target_list:
+            logger.error("Probe request missing 'target' parameter")
+            self.send_response(400)
+            self.send_header('Content-Type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b"Bad Request: 'target' parameter is required")
+            return
+
+        target_name = target_list[0]
+        logger.info(f"Received probe request for target: {target_name}")
+
+        target_config = self.config.get_target_config(target_name)
+
+        if not target_config:
+            logger.error(f"Target '{target_name}' not found in configuration")
+            self.send_response(404)
+            self.send_header('Content-Type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(f"Target '{target_name}' not found in configuration".encode('utf-8'))
+            return
+
+        registry = CollectorRegistry()
+        collector = None
+
+        try:
+            collector = CommvaultCollector(target_name, target_config)
+            collector.initialize_client()
+            registry.register(collector)
+
+            # Generate metrics using the temporary registry and collector instance
+            output = generate_latest(registry)
+
+            # Send success response
+            self.send_response(200)
+            # Use the directly imported constant here
+            self.send_header('Content-Type', CONTENT_TYPE_LATEST)
+            self.end_headers()
+            self.wfile.write(output)
+            logger.info(f"Successfully processed probe for target: {target_name}")
+
+        except Exception as e:
+            error_message = f"Failed to probe target '{target_name}': {str(e)}"
+            logger.exception(error_message) # Log full traceback for debugging
+            self.send_response(500)
+            self.send_header('Content-Type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(error_message.encode('utf-8'))
+
+
+# --- Exporter Start Function ---
+
+def start_http_server(config: ConfigHandler):
+    """Starts the single HTTP server for the /probe endpoint."""
+    port = config.get_exporter_port()
+    logger.info(f"Starting exporter HTTP server on port {port} for /probe endpoint")
+
+    handler = functools.partial(ProbeHandler, config)
+    server = None
+    try:
+        server = HTTPServer(('', port), handler)
+        server.serve_forever()
+    except OSError as e:
+        logger.error(f"Failed to start HTTP server on port {port}: {e} - Is the port already in use?")
+        sys.exit(f"Port {port} already in use.")
+    except KeyboardInterrupt:
+        logger.info("Exporter server received shutdown signal.")
+        if server:
+             server.shutdown()
+        logger.info("Exporter server stopped.")
+    except Exception as e:
+        logger.error(f"Exporter HTTP server failed unexpectedly: {e}", exc_info=True)
+        if server:
+            server.shutdown()
+        raise
+
 
 def start_exporter(config: ConfigHandler):
-    """Start the Prometheus exporter"""
-    try:
-        logger.debug(f"start_exporter received config type: {type(config)}")
-        if not isinstance(config, ConfigHandler):
-            raise ValueError(f"Expected ConfigHandler, got {type(config)}")
-            
-        logger.info("Starting Commvault exporter")
-        collector = CommvaultCollector(config)
-        
-        port = config.get('exporter', 'port', default=9657)
-        start_http_server(port)
-        REGISTRY.register(collector)
-        logger.info(f"Exporter started on port {port}")
-    except Exception as e:
-        logger.error(f"Failed to start exporter: {str(e)}")
-        raise
+    """
+    Initializes and starts the exporter's HTTP server.
+    """
+    if not isinstance(config, ConfigHandler):
+        raise ValueError(f"start_exporter requires a ConfigHandler instance, got {type(config)}")
+
+    if not config.get_all_targets():
+        logger.warning("No targets defined in configuration. Server will start but /probe requests will fail to find targets.")
+
+    start_http_server(config)
